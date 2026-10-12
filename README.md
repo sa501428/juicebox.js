@@ -289,3 +289,7 @@ scaled All it also reports bytes and query time and compares count totals.
 Whole-genome A/B comparisons require matching physical stored-All layouts.
 Different synthetic finest bin sizes are supported when the physical layout
 matches. For different overview layouts, select real chromosomes to compare.
+
+Scaled All overviews may use fractional display pixels so grids wider than
+the viewport fit completely. Raw query coordinates and stored counts remain
+unchanged by this display scaling.
