@@ -164,7 +164,7 @@ class InteractionHandler {
      * @param {number} scaleFactor - Scale factor (>1 = zoom in, <1 = zoom out)
      */
     async pinchZoom(anchorPx, anchorPy, scaleFactor) {
-        if (this.browser.state.chr1 === 0) {
+        if (this.browser.dataset.isWholeGenome(this.browser.state.chr1)) {
             await this.zoomAndCenter(1, anchorPx, anchorPy);
             return;
         }
@@ -226,7 +226,8 @@ class InteractionHandler {
             // A single-chromosome assembly has no whole-genome view to fall out
             // to: `All` is the sentinel rung of the scaffold now, and zooming
             // past the last declared rung already lands there. ADR-0010.
-            const canLeaveForWholeGenome = !this.browser.dataset.isSingleChromosome();
+            const canLeaveForWholeGenome = this.browser.dataset.wholeGenomeChromosome != null &&
+                !this.browser.dataset.isSingleChromosome();
 
             if (canLeaveForWholeGenome && !this.browser.resolutionLocked && scaleFactor < 1 && newZoom < z) {
                 // Zoom out to whole genome
@@ -307,7 +308,7 @@ class InteractionHandler {
      */
     async _performWheelZoom(anchorPx, anchorPy, scaleFactor) {
         // Handle transition from whole genome to chromosome view
-        if (this.browser.state.chr1 === 0) {
+        if (this.browser.dataset.isWholeGenome(this.browser.state.chr1)) {
             // In whole genome view, only zoom in (jump to chromosome)
             // Zoom out doesn't make sense at whole genome level
             if (scaleFactor > 1) {

@@ -236,3 +236,38 @@ For an out-of-the box web application for viewing and sharing contact maps from 
 juicebox.js is [MIT](/LICENSE) licensed.
 
 
+
+## Local v10 development
+
+This checkout uses `file:../hic-straw-js` so its build includes the local v10
+reader. Keep the sibling repositories together and build in dependency order
+with Node 24+:
+
+```sh
+cd ../hic-straw-js
+npm ci
+npm run build
+cd ../juicebox.js
+npm ci
+npm run build
+cd ../juicebox-web
+npm ci
+npm run build
+```
+
+V10 resolutions are adapted to Juicebox's coarse-to-fine zoom indices without
+changing Straw's on-disk indices. Canvas rendering converts counts to numbers;
+raw Straw queries retain exact bigint counts above Number.MAX_SAFE_INTEGER.
+Files without an All chromosome open on their first real chromosome.
+
+Code tests use small local binary fixtures and a simulated DOM. To validate a
+larger file without opening a browser:
+
+```sh
+npm run validate:v10 -- /path/to/file.hic
+```
+
+This checks derived sums, normalization, trans contacts, and rendered pixel
+buffers in sampled regions. It is not an exhaustive scan of the file. To release
+these repositories independently, replace the local dependencies with published
+versions or pinned commits containing the v10 reader and adapter before deploying.

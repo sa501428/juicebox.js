@@ -58,6 +58,7 @@ const dataset = ({
     const calls = []
     return {
         isLive,
+        isWholeGenome: index => index === 0,
         calls,
         bpResolutions: resolutions,
         getBinSizeForZoomIndex: (i) => resolutions[i],

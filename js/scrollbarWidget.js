@@ -54,7 +54,7 @@ class ScrollbarWidget {
 
         const { dataset } = this.browser;
 
-        if (state.chr1 === 0) {
+        if (dataset.isWholeGenome(state.chr1)) {
             this.xAxisScrollbarElement.style.display = 'none';
             this.yAxisScrollbarElement.style.display = 'none';
         } else {

@@ -59,7 +59,8 @@ class ChromosomeSelector {
 
     syncSelectors(sourceSelector, targetSelector) {
         const value = sourceSelector.value;
-        if (parseInt(value, 10) === 0 || parseInt(targetSelector.value, 10) === 0) {
+        if (this.browser.dataset?.isWholeGenome(parseInt(value, 10)) ||
+            this.browser.dataset?.isWholeGenome(parseInt(targetSelector.value, 10))) {
             targetSelector.value = value;
         }
     }

@@ -31,6 +31,7 @@ import {getUrlMapper} from "./urlMapper.js"
 import Straw from 'hic-straw'
 import {SENTINEL_ZOOM} from './sentinelZoom.js'
 import Genome from './genome.js'
+import {V10DisplayMatrix, displayRecords} from './v10DatasetAdapter.js'
 
 const knownGenomes = {
 
@@ -275,7 +276,7 @@ class Dataset {
      * the data behind it is the `All` matrix, queried in the `All` matrix's own
      * coordinates exactly as the whole-genome view queries it today.
      *
-     * This is why `imageTileSource`'s `0 === zd.chr1.index` stays true at the
+     * This is why `imageTileSource`'s whole-genome test stays true at the
      * sentinel while `browser.isWholeGenome()` is false. The two whole-genome
      * tests are divergent **by design** -- ADR-0010 decisions 3 and 4. Do not
      * "fix" them into agreement.
@@ -397,7 +398,13 @@ class HiCDataset extends Dataset {
 
         this.genomeId = this.hicFile.genomeId
         this.chromosomes = this.hicFile.chromosomes
-        this.bpResolutions = this.hicFile.bpResolutions
+        this.bpResolutions = this.hicFile.version === 10
+            ? [...this.hicFile.bpResolutions].reverse()
+            : this.hicFile.bpResolutions
+        this.fragResolutions = this.hicFile.version === 10
+            ? [...this.hicFile.fragResolutions].reverse()
+            : this.hicFile.fragResolutions
+        this.displayMatrixCache = new WeakMap()
         this.wholeGenomeChromosome = this.hicFile.wholeGenomeChromosome
         this.wholeGenomeResolution = this.hicFile.wholeGenomeResolution
 
@@ -407,7 +414,10 @@ class HiCDataset extends Dataset {
     }
 
     async getContactRecords(normalization, region1, region2, units, binsize) {
-        return this.straw.getContactRecords(normalization, region1, region2, units, binsize)
+        const records = await this.straw.getContactRecords(normalization, region1, region2, units, binsize)
+        if (this.hicFile.version !== 10) return records
+        const sameChromosome = this.straw.getFileChrName(region1.chr) === this.straw.getFileChrName(region2.chr)
+        return displayRecords(records, sameChromosome)
     }
 
     async hasNormalizationVector(type, chr, unit, binSize) {
@@ -419,7 +429,12 @@ class HiCDataset extends Dataset {
     }
 
     async getMatrix(chr1, chr2) {
-        return this.hicFile.getMatrix(chr1, chr2)
+        const matrix = await this.hicFile.getMatrix(chr1, chr2)
+        if (!matrix || this.hicFile.version !== 10) return matrix
+        if (!this.displayMatrixCache.has(matrix)) {
+            this.displayMatrixCache.set(matrix, new V10DisplayMatrix(matrix))
+        }
+        return this.displayMatrixCache.get(matrix)
     }
 
     async getNormVectorIndex() {

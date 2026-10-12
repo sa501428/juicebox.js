@@ -41,7 +41,8 @@
     "test": "vitest",
     "test:ui": "vitest --ui",
     "test:run": "vitest run",
-    "measure-consumers": "node scripts/measure-consumers.js"
+    "measure-consumers": "node scripts/measure-consumers.js",
+    "validate:v10": "node scripts/validate-v10.js"
   },
   "keywords": [
     "conformation capture",
@@ -57,7 +58,7 @@
     "@vitest/ui": "^4.0.7",
     "atob": "^2.1.2",
     "btoa": "^1.2.1",
-    "hic-straw": "github:aidenlab/hic-straw#v4.0.1",
+    "hic-straw": "file:../hic-straw-js",
     "igv": "3.8.9",
     "igv-ui": "github:igvteam/igv-ui#v1.5.9",
     "igv-utils": "github:igvteam/igv-utils#v1.7.1",

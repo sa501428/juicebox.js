@@ -169,7 +169,7 @@ class ImageTileSource {
         // Which matrix carries the view, and at which of its resolutions. An
         // identity for a declared rung; at the sentinel it is the whole-genome
         // matrix, queried in the whole-genome matrix's own coordinates exactly
-        // as the `All` view queries it. That is what keeps `0 === zd.chr1.index`
+        // as the `All` view queries it. That is what keeps the dataset whole-genome test
         // -- and so the x4 auto-threshold below -- true at the sentinel, while
         // `browser.isWholeGenome()` is false. Divergent by design; see
         // ADR-0010 decisions 3 and 4 before reconciling them.
@@ -281,7 +281,7 @@ class ImageTileSource {
 
             const threshold = autoThreshold(records, {
                 isLive: ds.isLive,
-                isWholeGenome: 0 === zd.chr1.index
+                isWholeGenome: ds.isWholeGenome(zd.chr1.index)
             })
 
             if (undefined !== threshold) {
