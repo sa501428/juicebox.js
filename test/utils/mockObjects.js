@@ -5,12 +5,13 @@
 
 import {File} from "./File.js"
 import {XMLHttpRequestMock} from "./XMLHttpRequestMock.js"
-import {Document, DOMImplementation} from "./Document.js";
-import {DOMParser} from "./DOMParser.js"
+import {Document, DOMImplementation} from "./Document.js"
+import atob from 'atob'
+import btoa from 'btoa'
 
-global.document = new Document();
+global.document = new Document()
 
-global.document.implementation = new DOMImplementation();    // For jQUery
+global.document.implementation = new DOMImplementation()    // For jQUery
 
 global.window = {
     document: global.document,
@@ -18,21 +19,20 @@ global.window = {
     }
 }
 
-global.File = File;
+global.File = File
 
-global.XMLHttpRequest = XMLHttpRequestMock;
+global.XMLHttpRequest = XMLHttpRequestMock
 
-global.navigator = {
-    userAgent: "Node",
-    vendor: "Node"
-}
+// navigator is read-only in Node.js, use defineProperty
+Object.defineProperty(global, 'navigator', {
+    value: {
+        userAgent: "Node",
+        vendor: "Node"
+    },
+    writable: true,
+    configurable: true
+})
 
-global.DOMParser = DOMParser;
+global.atob = atob
 
-global.atob = require('atob');
-
-global.btoa = require('btoa')
-
-global.fetch = require('node-fetch');
-
-
+global.btoa = btoa

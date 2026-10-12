@@ -1,0 +1,499 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Architecture review — juicebox.js</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script type="module">
+      import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+      mermaid.initialize({ startOnLoad: true, theme: "neutral", securityLevel: "loose", flowchart: { curve: "basis" } });
+    </script>
+    <style>
+      .seam { stroke-dasharray: 5 5; }
+      .leak { stroke: #dc2626; }
+      .deep { background: linear-gradient(135deg, #0f172a, #1e293b); }
+      .hatch { background-image: repeating-linear-gradient(45deg, #e7e5e4 0 6px, #f5f5f4 6px 12px); }
+      .mermaid { font-size: 13px; }
+      article, section { scroll-margin-top: 2rem; }
+      details > summary { cursor: pointer; list-style: none; }
+      details > summary::-webkit-details-marker { display: none; }
+      details[open] .chev { transform: rotate(90deg); }
+      .chev { transition: transform .15s ease; display: inline-block; }
+    </style>
+  </head>
+  <body class="bg-stone-50 text-slate-900 font-sans antialiased">
+    <main class="max-w-5xl mx-auto px-6 py-12 space-y-14">
+
+      <header class="space-y-6 border-b border-stone-300 pb-8">
+        <div>
+          <h1 class="font-serif text-4xl tracking-tight">Architecture review — juicebox.js</h1>
+          <p class="text-sm text-slate-500 mt-2 font-mono">master · v4.5.0 · updated 18 September 2026</p>
+          <p class="text-sm text-slate-500 mt-1 font-mono">the refactor backlog — what to fix next, and nothing else</p>
+        </div>
+
+        <div class="rounded-lg border-2 border-emerald-600 bg-emerald-50 p-5 space-y-2">
+          <div class="text-xs uppercase tracking-wider text-emerald-900">Progress</div>
+          <p class="text-sm text-emerald-950"><strong>Eight of the eleven original candidates have landed</strong>, all shipped in <span class="font-mono">v4.0.0</span>. They are one line each in <a href="#landed" class="underline decoration-emerald-700 underline-offset-2">Landed</a>; the reasons live in their ADRs.</p>
+          <p class="text-sm text-emerald-950"><strong>Three remain, each an open issue waiting on a decision rather than on code</strong> — <a href="#c10" class="underline decoration-emerald-700 underline-offset-2">10</a> (#581), <a href="#c7" class="underline decoration-emerald-700 underline-offset-2">7</a> (#580) and <a href="#c11" class="underline decoration-emerald-700 underline-offset-2">11</a> (#582). None is queued behind another.</p>
+          <p class="text-sm text-emerald-950"><strong>Since the review, the hub has grown back.</strong> The sync and targeting work of v4.1–v4.4 took <span class="font-mono">hicBrowser.js</span> from 1235 to 1753 lines and <span class="font-mono">browserRegistry.js</span> from 429 to 799. No card covers that code — see <a href="#next" class="underline decoration-emerald-700 underline-offset-2">Next task</a>.</p>
+        </div>
+
+        <div class="rounded-lg border-2 border-rose-500 bg-rose-50 p-5 space-y-2">
+          <div class="text-xs uppercase tracking-wider text-rose-900">Before scoping any card — the consumer lens</div>
+          <p class="text-sm text-rose-950">juicebox.js is an embeddable component. <span class="font-mono">HICBrowser</span> is not exported from <span class="font-mono">js/index.js</span>, but hosts get instances from <span class="font-mono">init()</span>, so its whole instance surface is public in practice. <strong>"No callers in <span class="font-mono">js/</span>" is half a finding</strong>: check the manifest, <span class="font-mono">js/publicApi.js</span>, and <a class="underline" href="adr/0003-public-api-contract.md">ADR-0003</a>. The review was first written without this, and two cards were wrong because of it. Every card below carries a <strong>Consumer impact</strong> block for that reason.</p>
+        </div>
+
+        <div class="flex flex-wrap items-center gap-x-8 gap-y-3 text-xs uppercase tracking-wider text-slate-500">
+          <span class="flex items-center gap-2"><span class="inline-block w-6 h-4 border border-slate-400 bg-white"></span> module</span>
+          <span class="flex items-center gap-2"><svg width="26" height="8"><line class="seam" x1="0" y1="4" x2="26" y2="4" stroke="#64748b" stroke-width="2"/></svg> seam</span>
+          <span class="flex items-center gap-2"><svg width="26" height="8"><line x1="0" y1="4" x2="22" y2="4" stroke="#dc2626" stroke-width="2"/><path d="M22 1 L26 4 L22 7 Z" fill="#dc2626"/></svg> leakage</span>
+          <span class="flex items-center gap-2"><span class="inline-block w-6 h-4 deep border-2 border-slate-900"></span> deep module</span>
+          <a href="#legend" class="underline decoration-slate-400 underline-offset-2 hover:text-slate-800">full legend &rarr;</a>
+        </div>
+
+        <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 text-center">
+          <div class="rounded border-2 border-emerald-600 bg-emerald-50 py-3"><div class="font-serif text-2xl text-emerald-900">8</div><div class="text-xs uppercase tracking-wider text-emerald-800">landed</div></div>
+          <div class="rounded border-2 border-sky-600 bg-sky-50 py-3"><div class="font-serif text-2xl text-sky-900">3</div><div class="text-xs uppercase tracking-wider text-sky-800">tracked</div></div>
+          <div class="rounded border border-stone-200 bg-white py-3"><div class="font-serif text-2xl">0</div><div class="text-xs uppercase tracking-wider text-slate-500">open, unfiled</div></div>
+          <div class="rounded border border-stone-200 bg-white py-3"><div class="font-serif text-2xl">1242</div><div class="text-xs uppercase tracking-wider text-slate-500">tests, 68 files</div></div>
+        </div>
+
+        <nav class="text-sm">
+          <div class="text-xs uppercase tracking-wider text-slate-500 mb-2">Contents</div>
+          <div class="grid sm:grid-cols-2 gap-x-8 gap-y-1 text-slate-600">
+            <a href="#open" class="hover:text-slate-900 underline decoration-slate-300 underline-offset-2">Open candidates — 10, 7, 11</a>
+            <a href="#next" class="hover:text-slate-900 underline decoration-slate-300 underline-offset-2">Next task</a>
+            <a href="#landed" class="hover:text-slate-900 underline decoration-slate-300 underline-offset-2">Landed — 1, 2, 3, 4, 5, 6, 8, 9</a>
+            <a href="#bugs" class="hover:text-slate-900 underline decoration-slate-300 underline-offset-2">Defects surfaced incidentally</a>
+            <a href="#caveats" class="hover:text-slate-900 underline decoration-slate-300 underline-offset-2">Reading this report now</a>
+          </div>
+        </nav>
+      </header>
+
+      <!-- ============ LEGEND ============ -->
+      <section id="legend">
+        <details class="rounded-lg border border-stone-300 bg-white">
+          <summary class="px-5 py-4 flex items-baseline gap-3">
+            <span class="chev text-slate-400">&#9656;</span>
+            <span class="font-serif text-xl">How to read this report</span>
+            <span class="text-xs text-slate-500 ml-auto">badges · diagram vocabulary · reading order</span>
+          </summary>
+          <div class="px-5 pb-5 space-y-6 border-t border-stone-200 pt-5">
+            <p class="text-sm text-slate-600">This document does one thing: it proposes a set of <strong>refactors</strong>, each a self-contained card. Everything else is scaffolding around that list. The vocabulary below is stable across reports of this kind.</p>
+
+            <div class="space-y-4">
+              <div class="text-xs uppercase tracking-wider text-slate-500">The three badges on each card</div>
+              <p class="text-sm text-slate-600">Every card's title row carries up to three chips. They answer three different questions and are easy to conflate.</p>
+
+              <div class="space-y-4 text-sm">
+                <div>
+                  <div class="font-semibold mb-2">1 · Status — where it stands right now</div>
+                  <div class="flex flex-wrap gap-3 items-center">
+                    <span class="text-xs uppercase tracking-wider px-2 py-1 rounded bg-emerald-600 text-white shrink-0">Landed</span><span class="text-slate-600">done and merged</span>
+                  </div>
+                  <div class="flex flex-wrap gap-3 items-center mt-2">
+                    <span class="text-xs uppercase tracking-wider px-2 py-1 rounded bg-sky-600 text-white shrink-0">Tracked &middot; #nnn</span><span class="text-slate-600">already an issue in the tracker — not new work</span>
+                  </div>
+                  <div class="flex flex-wrap gap-3 items-center mt-2">
+                    <span class="text-xs uppercase tracking-wider px-2 py-1 rounded bg-amber-500 text-white shrink-0">Next</span><span class="text-slate-600">the single recommended starting point</span>
+                  </div>
+                  <div class="flex flex-wrap gap-3 items-center mt-2">
+                    <span class="text-xs uppercase tracking-wider px-2 py-1 rounded bg-white border border-slate-300 text-slate-600 shrink-0">Open</span><span class="text-slate-600">not started, backlog</span>
+                  </div>
+                </div>
+
+                <div>
+                  <div class="font-semibold mb-2">2 · Confidence — how sure the review is it's worth doing</div>
+                  <div class="flex flex-wrap gap-3 items-center">
+                    <span class="text-xs uppercase tracking-wider px-2 py-1 rounded bg-emerald-100 text-emerald-900 shrink-0">Strong</span><span class="text-slate-600">the case is made; the evidence is in the card</span>
+                  </div>
+                  <div class="flex flex-wrap gap-3 items-center mt-2">
+                    <span class="text-xs uppercase tracking-wider px-2 py-1 rounded bg-amber-100 text-amber-900 shrink-0">Worth exploring</span><span class="text-slate-600">plausible, but scope it before committing</span>
+                  </div>
+                  <div class="flex flex-wrap gap-3 items-center mt-2">
+                    <span class="text-xs uppercase tracking-wider px-2 py-1 rounded bg-slate-200 text-slate-700 shrink-0">Speculative</span><span class="text-slate-600">may not survive contact with the code</span>
+                  </div>
+                </div>
+
+                <div>
+                  <div class="font-semibold mb-2">3 · Refactor shape — <em>what kind</em> of move it is</div>
+                  <p class="text-slate-600 mb-2">Always gray, so it reads as noise. It isn't — it is the best single predictor of how the work will feel.</p>
+                  <div class="flex flex-wrap gap-3 items-start">
+                    <span class="text-xs uppercase tracking-wider px-2 py-1 rounded bg-slate-200 text-slate-700 shrink-0">deletion test</span><span class="text-slate-600">the win is that code <em>disappears</em>. Nothing is rebuilt elsewhere. Complexity vanishes, it does not move.</span>
+                  </div>
+                  <div class="flex flex-wrap gap-3 items-start mt-2">
+                    <span class="text-xs uppercase tracking-wider px-2 py-1 rounded bg-slate-200 text-slate-700 shrink-0">in-process</span><span class="text-slate-600">logic moves out of one module into another behind a real interface. Same behaviour, better boundary.</span>
+                  </div>
+                  <div class="flex flex-wrap gap-3 items-start mt-2">
+                    <span class="text-xs uppercase tracking-wider px-2 py-1 rounded bg-slate-200 text-slate-700 shrink-0">ports &amp; adapters</span><span class="text-slate-600">several near-identical paths collapse into one interface with pluggable sources. Two real adapters justify the seam; one is hypothetical.</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="space-y-3">
+              <div class="text-xs uppercase tracking-wider text-slate-500">The before / after diagrams</div>
+              <p class="text-sm text-slate-600">Every card makes the same two-panel argument: <strong>left is today, right is proposed</strong>. The visual language is identical across all cards, whether the panel is an SVG or a mermaid graph.</p>
+              <dl class="grid sm:grid-cols-2 gap-x-8 gap-y-3 text-sm">
+                <div class="flex gap-3 items-start"><dt class="shrink-0 pt-1"><span class="inline-block w-8 h-5 bg-red-100 border border-red-500"></span></dt><dd><strong>Red fill</strong> — the problem. Tangled code, dead code, or a field that lies.</dd></div>
+                <div class="flex gap-3 items-start"><dt class="shrink-0 pt-1"><svg width="32" height="10"><line x1="0" y1="5" x2="27" y2="5" stroke="#dc2626" stroke-width="2"/><path d="M27 2 L32 5 L27 8 Z" fill="#dc2626"/></svg></dt><dd><strong>Red arrow — leakage.</strong> Something reaching across a boundary it should not know about.</dd></div>
+                <div class="flex gap-3 items-start"><dt class="shrink-0 pt-1"><span class="inline-block w-8 h-5 deep border-2 border-slate-900"></span></dt><dd><strong>Dark navy block — the deep module.</strong> Small interface on top, substantial logic hidden inside. This is the goal state in every card; it only ever appears on the right.</dd></div>
+                <div class="flex gap-3 items-start"><dt class="shrink-0 pt-1"><svg width="32" height="10"><line class="seam" x1="0" y1="5" x2="32" y2="5" stroke="#64748b" stroke-width="2"/></svg></dt><dd><strong>Dashed gray line — a seam.</strong> The new boundary being introduced, and the line the tests will run against.</dd></div>
+                <div class="flex gap-3 items-start"><dt class="shrink-0 pt-1"><span class="inline-block w-8 h-5 bg-white border border-slate-400"></span></dt><dd><strong>White box</strong> — an ordinary module. Unremarkable, left alone.</dd></div>
+                <div class="flex gap-3 items-start"><dt class="shrink-0 pt-1"><span class="inline-block w-8 h-5 bg-emerald-50 border border-emerald-500"></span></dt><dd><strong>Green</strong> — pure, tested, or extracted-and-now-testable. Free functions with no I/O and no framework.</dd></div>
+              </dl>
+              <p class="text-sm text-slate-600 pt-1">The shorthand: <strong>how much red on the left, how much navy on the right.</strong> That is the whole picture. Card <a href="#c10" class="underline decoration-slate-400 underline-offset-2">10</a> is the clearest instance — three red near-clones become one navy interface.</p>
+            </div>
+
+            <div class="space-y-3">
+              <div class="text-xs uppercase tracking-wider text-slate-500">Anatomy of a card</div>
+              <ol class="text-sm space-y-2 list-decimal list-inside text-slate-600">
+                <li><strong>Title + three badges</strong> — the claim and its standing.</li>
+                <li><strong>Monospace file list</strong> — every file the work touches. A rough proxy for blast radius.</li>
+                <li><strong>Before / after panels</strong> — the argument, in the visual language above.</li>
+                <li><strong>Problem / Solution pair</strong> — the same argument in two sentences. If you read nothing else on a card, read this.</li>
+                <li><strong>Bulleted payoff list</strong> — why it is worth it. Recurring terms: <em>leverage</em> (one interface replaces many call shapes), <em>locality</em> (one place to look instead of several), <em>the interface is the test surface</em> (it becomes testable without standing the whole system up).</li>
+                <li><strong>Amber box, when present</strong> — a caveat to check <em>before</em> starting.</li>
+                <li><strong>When it lands</strong> — the card leaves the backlog and becomes one row in <a href="#landed" class="underline decoration-slate-400 underline-offset-2">Landed</a>. What the work found goes in its ADR.</li>
+              </ol>
+            </div>
+
+            <div class="space-y-3">
+              <div class="text-xs uppercase tracking-wider text-slate-500">Suggested reading order</div>
+              <p class="text-sm text-slate-600">Not front to back. The cards are a backlog, written to be read when you reach them.</p>
+              <ol class="text-sm space-y-1 list-decimal list-inside text-slate-600">
+                <li>The green <strong>Progress</strong> box at the top — where things stand.</li>
+                <li>The <a href="#next" class="underline decoration-slate-400 underline-offset-2"><strong>Next task</strong></a> section — one recommendation, or the decision each open card is waiting on.</li>
+                <li>That one card. Nothing else.</li>
+                <li><a href="#caveats" class="underline decoration-slate-400 underline-offset-2"><strong>Reading this report now</strong></a>, at the very end — buried, and the most load-bearing part. It records what has drifted.</li>
+              </ol>
+            </div>
+          </div>
+        </details>
+      </section>
+
+      <!-- ============ OPEN CANDIDATES ============ -->
+      <section id="open" class="space-y-14">
+        <h2 class="font-serif text-3xl border-b border-stone-300 pb-3">Open candidates</h2>
+
+        <!-- ---- 10 ---- -->
+        <article id="c10" class="space-y-5">
+          <div class="flex items-baseline justify-between gap-4 flex-wrap">
+            <h3 class="font-serif text-2xl">10 · One dataset-load path — <em>this is the live-map seam</em></h3>
+            <div class="flex gap-2 shrink-0">
+              <span class="text-xs uppercase tracking-wider px-2 py-1 rounded bg-sky-600 text-white">Tracked &middot; #581</span>
+              <span class="text-xs uppercase tracking-wider px-2 py-1 rounded bg-amber-100 text-amber-900">Worth exploring</span>
+              <span class="text-xs uppercase tracking-wider px-2 py-1 rounded bg-slate-200 text-slate-700">ports &amp; adapters</span>
+            </div>
+          </div>
+
+          <p class="font-mono text-sm text-slate-600">js/dataLoader.js · js/hicDataset.js · js/imageTileCore.js</p>
+
+          <div class="grid md:grid-cols-2 gap-4">
+            <div class="rounded-lg border border-slate-200 bg-white p-4 space-y-2">
+              <div class="text-xs uppercase tracking-wider text-slate-500 mb-2">Before — three near-clones</div>
+              <div class="space-y-2 text-[11px] font-mono">
+                <div class="border border-red-300 bg-red-50 rounded p-2">
+                  <div class="text-red-900 font-semibold">loadHicFile · 186 lines</div>
+                  <div class="text-slate-600">shield · label · spinner · Dataset.loadDataset · Genome · state ladder · nvi lookup · sync · notify ×5 · try/catch/finally</div>
+                </div>
+                <div class="border border-red-300 bg-red-50 rounded p-2">
+                  <div class="text-red-900 font-semibold">loadLiveContactMap · 78 lines</div>
+                  <div class="text-slate-600">shield · label · HiCDataset · Genome · <span class="hatch px-1">state ladder (duplicated)</span> · notify ×4</div>
+                </div>
+                <div class="border border-red-300 bg-red-50 rounded p-2">
+                  <div class="text-red-900 font-semibold">loadHicControlFile · 66 lines</div>
+                  <div class="text-slate-600">shield · label · Dataset.loadDataset · <span class="text-red-700">its own catch and alert</span> · notify ×2</div>
+                </div>
+                <div class="border border-slate-300 rounded p-2 text-slate-600">
+                  reaches out to: <span class="text-red-700">browser.userInteractionShield</span>, <span class="text-red-700">contactMapLabel</span> and <span class="text-red-700">browser.genome</span>
+                </div>
+              </div>
+            </div>
+            <div class="rounded-lg border border-slate-200 bg-white p-4 space-y-2">
+              <div class="text-xs uppercase tracking-wider text-slate-500 mb-2">After — collapsed</div>
+              <div class="space-y-2 text-[11px] font-mono">
+                <div class="border-2 border-slate-900 deep rounded p-2 text-slate-200">
+                  <div class="font-semibold text-white">loadMap(source, role) — one interface</div>
+                  <div class="text-slate-400 mt-1">source adapter: <span class="text-slate-200">.hic file</span> | <span class="text-slate-200">live contact map</span></div>
+                  <div class="text-slate-400">role: <span class="text-slate-200">primary</span> | <span class="text-slate-200">control</span></div>
+                  <div class="text-slate-500 mt-2">one error contract · one spinner/shield discipline · one notify sequence</div>
+                </div>
+                <div class="border border-emerald-400 bg-emerald-50 rounded p-2">
+                  <div class="text-emerald-900 font-semibold">chooseInitialState(config) — pure</div>
+                  <div class="text-slate-600">the State.default / parse / fromJSON ladder, extracted and tested</div>
+                </div>
+                <div class="border border-emerald-400 bg-emerald-50 rounded p-2">
+                  <div class="text-emerald-900 font-semibold">classifyTrack(config) — pure</div>
+                  <div class="text-slate-600">1D/2D dispatch incl. the .txt/.txt.gz case, extracted and tested</div>
+                </div>
+                <div class="border border-slate-300 rounded p-2 text-slate-600">DOM labels and shield move to the coordinator</div>
+              </div>
+            </div>
+          </div>
+
+          <dl class="grid sm:grid-cols-2 gap-x-8 gap-y-3 text-sm">
+            <div><dt class="text-xs uppercase tracking-wider text-slate-500">Problem</dt><dd>Three load paths share ~60% of their bodies but diverge in error handling, and the two genuinely pure decisions inside them — initial-state selection and the 1D/2D track heuristic — are trapped in long async methods with network, DOM and module globals in the way.</dd></div>
+            <div><dt class="text-xs uppercase tracking-wider text-slate-500">Solution</dt><dd>One <span class="font-mono">loadMap(source, role)</span> interface with two source adapters; lift the two pure decisions out as free functions.</dd></div>
+          </dl>
+
+          <ul class="text-sm space-y-1 list-disc list-inside marker:text-amber-600">
+            <li>two adapters justify the seam: .hic file and live contact map</li>
+            <li>locality: one error contract, one shield-and-spinner discipline, one notify sequence</li>
+            <li>the pure ladders become testable with object literals</li>
+            <li>the data module stops writing DOM labels</li>
+            <li>one place for the post-load sync step — the live path already gets it wrong, leaving a one-sided sync edge (#638)</li>
+          </ul>
+          <div class="rounded border border-sky-300 bg-sky-50 px-4 py-3 text-sm text-sky-900 space-y-1">
+            <div class="text-xs uppercase tracking-wider opacity-70">Consumer impact — three named entry points must survive</div>
+            <div><span class="font-mono">loadHicFile</span> (both apps), <span class="font-mono">loadHicControlFile</span> (juicebox-web) and <span class="font-mono">loadLiveContactMap</span> (Spacewalk) are three distinct public calls with three signatures. Collapsing them onto one internal <span class="font-mono">loadMap(source, role)</span> is fine — the three named methods on <span class="font-mono">HICBrowser</span> are not optional, and their argument shapes are contract. <br><br>Spacewalk passes <span class="font-mono">{liveContactMap, name, locus}</span>; juicebox-web passes <span class="font-mono">{url, name, nvi, ...}</span>. All three are declared in <span class="font-mono">js/publicApi.js</span>; removing one fails <span class="font-mono">test/testPublicApi.js</span>.</div>
+          </div>
+
+          <div class="rounded border border-amber-400 bg-amber-50 px-4 py-3 text-sm text-amber-950 space-y-2">
+            <div class="text-xs uppercase tracking-wider opacity-70">Read this before scoping — what the card's title hides</div>
+            <p>This candidate <strong>is the live contact map seam</strong>, and the seam was built as an expediency: the goal was to make a live map, streamed from hic-straw, look to juicebox.js like a file-based <span class="font-mono">.hic</span> map. The disguise is deliberate and mostly successful — but "one load path" means <em>deciding whether the disguise was the right call</em>, not just deduplicating three method bodies.</p>
+            <p>The debt spans three repos. The core work lives in <span class="font-mono">hic-straw</span> (which is not in the architecture review at all) and in Spacewalk; what reached juicebox.js is a thin adapter. Narrow, but it leaks in exactly three places:</p>
+            <ul class="list-disc list-inside space-y-1">
+              <li><span class="font-mono">js/hicDataset.js</span> — <span class="font-mono">isLive</span> is set from config and <span class="font-mono">datasetType</span> derived from it. Both are consumer contract; Spacewalk branches on <span class="font-mono">dataset.isLive</span>.</li>
+              <li><span class="font-mono">js/imageTileCore.js</span> — <span class="font-mono">autoThreshold</span> takes the 75th percentile instead of the 95th and clamps to 1 for live maps. <strong>A genuine rendering divergence</strong>, not an adapter detail: the disguise does not hold here, and any change to the load path has to keep this branch reachable.</li>
+              <li><span class="font-mono">js/dataLoader.js</span> — <span class="font-mono">loadLiveContactMap</span> as a separate path, with the state ladder duplicated from <span class="font-mono">loadHicFile</span>.</li>
+            </ul>
+            <p><strong>#471</strong> settled the <span class="font-mono">datasetType</span> vocabulary to <span class="font-mono">'live' | 'hic' | 'unknown'</span>. Whether the coordinator payload should carry it at all is still this card's question.</p>
+          </div>
+        </article>
+
+        <!-- ---- 7 ---- -->
+        <article id="c7" class="space-y-5">
+          <div class="flex items-baseline justify-between gap-4 flex-wrap">
+            <h3 class="font-serif text-2xl">7 · Move the gesture state machines behind InteractionHandler</h3>
+            <div class="flex gap-2 shrink-0">
+              <span class="text-xs uppercase tracking-wider px-2 py-1 rounded bg-sky-600 text-white">Tracked &middot; #580</span>
+              <span class="text-xs uppercase tracking-wider px-2 py-1 rounded bg-amber-100 text-amber-900">Worth exploring</span>
+              <span class="text-xs uppercase tracking-wider px-2 py-1 rounded bg-slate-200 text-slate-700">in-process</span>
+            </div>
+          </div>
+
+          <p class="font-mono text-sm text-slate-600">js/contactMatrixView.js (addMouseHandlers, addTouchHandlers) · js/interactionHandler.js · js/sweepZoom.js</p>
+
+          <div class="grid md:grid-cols-2 gap-4">
+            <div class="rounded-lg border border-slate-200 bg-white p-4">
+              <div class="text-xs uppercase tracking-wider text-slate-500 mb-2">Before</div>
+              <svg viewBox="0 0 300 260" class="w-full">
+                <rect x="8" y="8" width="284" height="118" fill="#fff" stroke="#94a3b8" stroke-width="1.5"/>
+                <text x="20" y="26" class="text-[9px] uppercase tracking-wider" fill="#475569">ContactMatrixView</text>
+                <rect x="20" y="36" width="120" height="34" fill="#fee2e2" stroke="#dc2626"/>
+                <text x="80" y="52" text-anchor="middle" class="text-[8px]" fill="#7f1d1d" font-family="monospace">addMouseHandlers</text>
+                <text x="80" y="63" text-anchor="middle" class="text-[7px]" fill="#7f1d1d" font-family="monospace">188 lines of closures</text>
+                <rect x="152" y="36" width="120" height="34" fill="#fee2e2" stroke="#dc2626"/>
+                <text x="212" y="52" text-anchor="middle" class="text-[8px]" fill="#7f1d1d" font-family="monospace">addTouchHandlers</text>
+                <text x="212" y="63" text-anchor="middle" class="text-[7px]" fill="#7f1d1d" font-family="monospace">120 lines of closures</text>
+                <text x="20" y="90" class="text-[8px]" fill="#7f1d1d" font-family="monospace">let startX, mouseDown, lastTouch, pinch …</text>
+                <text x="20" y="103" class="text-[8px]" fill="#7f1d1d" font-family="monospace">no test surface: state lives in closures</text>
+                <text x="20" y="116" class="text-[8px]" fill="#7f1d1d" font-family="monospace">browserCoordinator installs these by hand</text>
+                <line class="leak" x1="80" y1="70" x2="80" y2="152" stroke="#dc2626" stroke-width="1.5"/>
+                <path d="M76 148 L80 156 L84 148 Z" fill="#dc2626"/>
+                <line class="leak" x1="212" y1="70" x2="212" y2="152" stroke="#dc2626" stroke-width="1.5"/>
+                <path d="M208 148 L212 156 L216 148 Z" fill="#dc2626"/>
+                <rect x="8" y="158" width="284" height="46" fill="#fff" stroke="#94a3b8" stroke-width="1.5"/>
+                <text x="150" y="178" text-anchor="middle" class="text-[9px] uppercase tracking-wider" fill="#475569">InteractionHandler (deep, partly tested)</text>
+                <text x="150" y="194" text-anchor="middle" class="text-[8px]" fill="#475569" font-family="monospace">shiftPixels · zoomAndCenter · pinchZoom · handleWheelZoom</text>
+                <rect x="8" y="214" width="284" height="38" fill="#fff" stroke="#94a3b8" stroke-width="1.5"/>
+                <text x="150" y="238" text-anchor="middle" class="text-[9px] uppercase tracking-wider" fill="#475569">State — translators → setView</text>
+              </svg>
+            </div>
+            <div class="rounded-lg border border-slate-200 bg-white p-4">
+              <div class="text-xs uppercase tracking-wider text-slate-500 mb-2">After</div>
+              <svg viewBox="0 0 300 260" class="w-full">
+                <rect x="8" y="8" width="284" height="46" fill="#fff" stroke="#94a3b8" stroke-width="1.5"/>
+                <text x="150" y="28" text-anchor="middle" class="text-[9px] uppercase tracking-wider" fill="#475569">ContactMatrixView</text>
+                <text x="150" y="44" text-anchor="middle" class="text-[8px]" fill="#475569" font-family="monospace">forwards raw pointer events, holds no gesture state</text>
+                <line class="seam" x1="8" y1="66" x2="292" y2="66" stroke="#64748b" stroke-width="2"/>
+                <text x="150" y="62" text-anchor="middle" class="text-[8px] uppercase tracking-wider" fill="#64748b">seam</text>
+                <rect x="8" y="78" width="284" height="126" fill="#0f172a" stroke="#0f172a" stroke-width="2"/>
+                <text x="150" y="98" text-anchor="middle" class="text-[9px] uppercase tracking-wider" fill="#e2e8f0">InteractionHandler</text>
+                <text x="20" y="118" class="text-[8px]" fill="#cbd5e1" font-family="monospace">onPointerDown/Move/Up · onWheel · onTouch*</text>
+                <text x="20" y="132" class="text-[8px]" fill="#cbd5e1" font-family="monospace">drag · double-click · pinch · sweep as explicit state</text>
+                <text x="20" y="146" class="text-[8px]" fill="#cbd5e1" font-family="monospace">pinchZoom / _performWheelZoom de-duplicated</text>
+                <text x="20" y="160" class="text-[8px]" fill="#cbd5e1" font-family="monospace">in-flight wheel accumulation (already here)</text>
+                <text x="20" y="174" class="text-[8px]" fill="#cbd5e1" font-family="monospace">→ translators only, no direct field writes</text>
+                <text x="20" y="192" class="text-[8px]" fill="#94a3b8" font-family="monospace">testable with synthetic event objects</text>
+                <rect x="8" y="214" width="284" height="38" fill="#fff" stroke="#94a3b8" stroke-width="1.5"/>
+                <text x="150" y="238" text-anchor="middle" class="text-[9px] uppercase tracking-wider" fill="#475569">State — translators → setView</text>
+              </svg>
+            </div>
+          </div>
+
+          <dl class="grid sm:grid-cols-2 gap-x-8 gap-y-3 text-sm">
+            <div><dt class="text-xs uppercase tracking-wider text-slate-500">Problem</dt><dd>Gesture state lives in <span class="font-mono">let</span> closures inside ~300 lines of the view, so drag, double-tap and pinch have no test surface — while the module that already owns gesture semantics sits directly underneath and is the best-tested one in the repo.</dd></div>
+            <div><dt class="text-xs uppercase tracking-wider text-slate-500">Solution</dt><dd>The view forwards raw pointer/touch/wheel events; <span class="font-mono">InteractionHandler</span> holds the gesture state explicitly and keeps routing to <span class="font-mono">State</span> translators.</dd></div>
+          </dl>
+
+          <ul class="text-sm space-y-1 list-disc list-inside marker:text-amber-600">
+            <li>the interface is the test surface: synthetic events in, state out</li>
+            <li>locality: gesture semantics stop straddling two modules</li>
+            <li>de-duplicates ~70 near-identical lines in <span class="font-mono">pinchZoom</span> / <span class="font-mono">_performWheelZoom</span></li>
+            <li>would have caught <span class="font-mono">const yLocus = { xLocus }</span> — object-wrapped instead of spread</li>
+            <li>extends the <span class="font-mono">setView</span> chokepoint discipline to the last unguarded paths</li>
+          </ul>
+          <div class="rounded border border-sky-300 bg-sky-50 px-4 py-3 text-sm text-sky-900 space-y-1">
+            <div class="text-xs uppercase tracking-wider opacity-70">Consumer impact — indirect, via two crosshair paths</div>
+            <div>No consumer touches the mouse or touch handlers, so the refactor surface itself is clear. But the gesture code being moved is what fires both crosshair paths Spacewalk depends on: <span class="font-mono">setCustomCrosshairsHandler</span> (registered at <span class="font-mono">juiceboxPanel.js:180</span>) and the <span class="font-mono">DidHideCrosshairs</span> event (<span class="font-mono">contactMatrixView.js:550</span>). Both must still fire, with the same payloads, after the state machines move.</div>
+          </div>
+        </article>
+
+        <!-- ---- 11 ---- -->
+        <article id="c11" class="space-y-5">
+          <div class="flex items-baseline justify-between gap-4 flex-wrap">
+            <h3 class="font-serif text-2xl">11 · Give the track tile one owner</h3>
+            <div class="flex gap-2 shrink-0">
+              <span class="text-xs uppercase tracking-wider px-2 py-1 rounded bg-sky-600 text-white">Tracked &middot; #582</span>
+              <span class="text-xs uppercase tracking-wider px-2 py-1 rounded bg-slate-200 text-slate-700">Speculative</span>
+              <span class="text-xs uppercase tracking-wider px-2 py-1 rounded bg-slate-200 text-slate-700">in-process</span>
+            </div>
+          </div>
+
+          <p class="font-mono text-sm text-slate-600">js/trackPair.js · js/trackRenderer.js · js/tile.js · js/layoutController.js</p>
+
+          <div class="grid md:grid-cols-2 gap-4">
+            <div class="rounded-lg border border-slate-200 bg-white p-4">
+              <div class="text-xs uppercase tracking-wider text-slate-500 mb-2">Before — four fields, one concept</div>
+              <svg viewBox="0 0 300 240" class="w-full">
+                <rect x="10" y="10" width="130" height="90" fill="#fff" stroke="#94a3b8" stroke-width="1.5"/>
+                <text x="75" y="28" text-anchor="middle" class="text-[9px] uppercase tracking-wider" fill="#475569">TrackPair</text>
+                <text x="20" y="46" class="text-[8px]" fill="#334155" font-family="monospace">this.tileX ← read</text>
+                <text x="20" y="59" class="text-[8px]" fill="#334155" font-family="monospace">this.tileY ← read</text>
+                <text x="20" y="72" class="text-[8px]" fill="#334155" font-family="monospace">this.tile   ← stray</text>
+                <text x="20" y="90" class="text-[8px]" fill="#7f1d1d" font-family="monospace">setColor / setDataRange</text>
+                <rect x="170" y="10" width="120" height="90" fill="#fff" stroke="#94a3b8" stroke-width="1.5"/>
+                <text x="230" y="28" text-anchor="middle" class="text-[9px] uppercase tracking-wider" fill="#475569">TrackRenderer</text>
+                <text x="180" y="50" class="text-[8px]" fill="#334155" font-family="monospace">this.tile ← written</text>
+                <text x="180" y="63" class="text-[8px]" fill="#334155" font-family="monospace">6 public fields</text>
+                <text x="180" y="76" class="text-[8px]" fill="#334155" font-family="monospace">isLoading() always false</text>
+                <line class="leak" x1="140" y1="86" x2="166" y2="60" stroke="#dc2626" stroke-width="1.5"/>
+                <path d="M162 56 L170 58 L165 65 Z" fill="#dc2626"/>
+                <text x="150" y="118" text-anchor="middle" class="text-[8px]" fill="#dc2626" font-family="monospace">invalidation writes the renderer's field…</text>
+                <text x="150" y="131" text-anchor="middle" class="text-[8px]" fill="#dc2626" font-family="monospace">…the read path consults the pair's — stale cache</text>
+                <rect x="10" y="150" width="280" height="36" fill="#fff" stroke="#94a3b8" stroke-width="1.5"/>
+                <text x="150" y="166" text-anchor="middle" class="text-[9px] uppercase tracking-wider" fill="#475569">LayoutController</text>
+                <text x="150" y="180" text-anchor="middle" class="text-[8px]" fill="#7f1d1d" font-family="monospace">constructs pairs · mutates browser.trackPairs · assigns .x/.y after construct</text>
+                <rect x="10" y="196" width="280" height="34" fill="#f5f5f4" stroke="#94a3b8" stroke-width="1.5"/>
+                <text x="150" y="212" text-anchor="middle" class="text-[9px] uppercase tracking-wider" fill="#475569">Tile — 18 lines, deep, untested</text>
+                <text x="150" y="224" text-anchor="middle" class="text-[8px]" fill="#64748b" font-family="monospace">containsRange(chr, startBP, endBP, bpp)</text>
+              </svg>
+            </div>
+            <div class="rounded-lg border border-slate-200 bg-white p-4">
+              <div class="text-xs uppercase tracking-wider text-slate-500 mb-2">After — cache owned by the pair</div>
+              <svg viewBox="0 0 300 240" class="w-full">
+                <rect x="10" y="10" width="280" height="110" fill="#0f172a" stroke="#0f172a" stroke-width="2"/>
+                <text x="150" y="30" text-anchor="middle" class="text-[9px] uppercase tracking-wider" fill="#e2e8f0">TrackPair — owns tiles for both axes</text>
+                <text x="24" y="50" class="text-[8px]" fill="#cbd5e1" font-family="monospace">tileFor(axis, genomicState)</text>
+                <text x="24" y="64" class="text-[8px]" fill="#cbd5e1" font-family="monospace">invalidate()  ← color, dataRange, autoscale</text>
+                <text x="24" y="78" class="text-[8px]" fill="#cbd5e1" font-family="monospace">doAutoscale exported, pure, tested</text>
+                <text x="24" y="96" class="text-[8px]" fill="#94a3b8" font-family="monospace">renderer holds no cache field</text>
+                <line class="seam" x1="10" y1="134" x2="290" y2="134" stroke="#64748b" stroke-width="2"/>
+                <text x="150" y="130" text-anchor="middle" class="text-[8px] uppercase tracking-wider" fill="#64748b">seam</text>
+                <rect x="10" y="146" width="130" height="40" fill="#fff" stroke="#94a3b8" stroke-width="1.5"/>
+                <text x="75" y="164" text-anchor="middle" class="text-[9px] uppercase tracking-wider" fill="#475569">TrackRenderer</text>
+                <text x="75" y="178" text-anchor="middle" class="text-[8px]" fill="#475569" font-family="monospace">canvas + blit only</text>
+                <rect x="160" y="146" width="130" height="40" fill="#fff" stroke="#94a3b8" stroke-width="1.5"/>
+                <text x="225" y="164" text-anchor="middle" class="text-[9px] uppercase tracking-wider" fill="#475569">LayoutController</text>
+                <text x="225" y="178" text-anchor="middle" class="text-[8px]" fill="#475569" font-family="monospace">DOM sizing only</text>
+                <rect x="10" y="198" width="280" height="34" fill="#f5f5f4" stroke="#94a3b8" stroke-width="1.5"/>
+                <text x="150" y="214" text-anchor="middle" class="text-[9px] uppercase tracking-wider" fill="#475569">Tile — unchanged, now tested</text>
+                <text x="150" y="226" text-anchor="middle" class="text-[8px]" fill="#64748b" font-family="monospace">already the cleanest module in the render path</text>
+              </svg>
+            </div>
+          </div>
+
+          <dl class="grid sm:grid-cols-2 gap-x-8 gap-y-3 text-sm">
+            <div><dt class="text-xs uppercase tracking-wider text-slate-500">Problem</dt><dd>Four fields hold the same track tile across two modules; invalidation on colour and data-range change writes the renderer's field while the read path consults the pair's. Meanwhile <span class="font-mono">LayoutController</span> constructs track pairs and mutates <span class="font-mono">browser.trackPairs</span>, so ordering is derived by parsing CSS <span class="font-mono">style.order</span> back out of the DOM.</dd></div>
+            <div><dt class="text-xs uppercase tracking-wider text-slate-500">Solution</dt><dd>The pair owns the tile cache for both axes; the renderer keeps canvas and blitting; layout keeps DOM sizing. Track ordering becomes a field on the pair, not a CSS read-back.</dd></div>
+          </dl>
+
+          <ul class="text-sm space-y-1 list-disc list-inside marker:text-slate-500">
+            <li>locality: one owner for the cache, one invalidation call</li>
+            <li>fixes stale tiles after colour / data-range change</li>
+            <li>layout stops being the model for track order</li>
+            <li><span class="font-mono">doAutoscale</span> is pure and unexported — export and test it</li>
+            <li>speculative because it touches igv-owned objects; scope with care</li>
+          </ul>
+          <div class="rounded border border-rose-300 bg-rose-50 px-4 py-3 text-sm text-rose-900 space-y-1">
+            <div class="text-xs uppercase tracking-wider opacity-70">Consumer impact — the track pair is published shape</div>
+            <div>juicebox-web calls <span class="font-mono">browser.layoutController.removeTrackXYPair(pair)</span>, and gets that <span class="font-mono">pair</span> from the global-bus <span class="font-mono">TrackXYPairLoad</span> / <span class="font-mono">TrackXYPairRemoval</span> payloads — reading <span class="font-mono">data.track.config.format</span> and <span class="font-mono">data.track.name</span> off it, keying its track index off <span class="font-mono">pair.browser</span>, and handing the same object back. <br><br>So <span class="font-mono">TrackPair.track</span>, <span class="font-mono">TrackPair.browser</span>, its <span class="font-mono">config.format</span>, and the two event payloads are all contract. "The pair owns the tile cache" is safe; renaming <span class="font-mono">.track</span> or changing what the events carry is not. Spacewalk separately calls <span class="font-mono">layoutController.getContactMatrixViewport()</span>.</div>
+          </div>
+        </article>
+      </section>
+
+      <!-- ============ NEXT ============ -->
+      <section id="next" class="space-y-4">
+        <h2 class="font-serif text-3xl border-b border-stone-300 pb-3">Next task</h2>
+        <div class="rounded-lg border-2 border-slate-900 deep text-slate-100 p-6 space-y-4">
+          <div class="flex items-baseline justify-between gap-4 flex-wrap">
+            <span class="font-serif text-2xl text-white">No card is marked Next — each waits on a decision</span>
+            <span class="text-xs uppercase tracking-wider px-2 py-1 rounded bg-emerald-500 text-emerald-950">8 of 11 landed · 3 tracked</span>
+          </div>
+          <p class="text-sm text-slate-300">All three open candidates are <span class="font-mono">ready-for-human</span>: the first move on each is a decision, then an ADR, then tickets. Picking one means answering its question:</p>
+          <ul class="text-sm text-slate-300 space-y-2 list-disc list-inside">
+            <li><a href="#c10" class="underline decoration-slate-500 underline-offset-2">10</a> · <a href="https://github.com/aidenlab/juicebox.js/issues/581">#581</a> — <strong>was the live-map disguise the right call?</strong> Spans three repos: hic-straw, Spacewalk, and the adapter here.</li>
+            <li><a href="#c7" class="underline decoration-slate-500 underline-offset-2">7</a> · <a href="https://github.com/aidenlab/juicebox.js/issues/580">#580</a> — <strong>can its shape be planned at all?</strong> About 300 lines of gesture closures with no test surface to read the behaviour off. The largest remaining deepening.</li>
+            <li><a href="#c11" class="underline decoration-slate-500 underline-offset-2">11</a> · <a href="https://github.com/aidenlab/juicebox.js/issues/582">#582</a> — <strong>split it?</strong> Cache ownership is safe and fixes a real stale-tile bug; the ordering half reaches into the published <span class="font-mono">TrackXYPairLoad</span> payload. Taking only the safe half may be the whole answer.</li>
+          </ul>
+          <p class="text-sm text-slate-300"><strong>What comes after: a fresh scan of the sync and targeting code.</strong> It arrived after this review was written — the sync-group pairing rule and isolation mark (<a class="underline decoration-slate-500 underline-offset-2" href="adr/0016-sync-membership-is-static.md">ADR-0016</a>), the resolution lock mirrored across a group (<a class="underline decoration-slate-500 underline-offset-2" href="adr/0014-view-preferences-mirror-canonical-state-syncs.md">ADR-0014</a>), and target sets (<a class="underline decoration-slate-500 underline-offset-2" href="adr/0015-targeting-is-not-a-sync-group.md">ADR-0015</a>), now carrying contact maps as well as tracks (<a class="underline decoration-slate-500 underline-offset-2" href="adr/0018-a-contact-map-broadcasts-to-the-target-set.md">ADR-0018</a>). The pure rules came out as small modules (<span class="font-mono">syncGroup.js</span>, <span class="font-mono">targetGroup.js</span>), but the wiring landed in <span class="font-mono">HICBrowser</span> and <span class="font-mono">BrowserRegistry</span>, which is why both grew. New cards, if that scan finds any, go in this document.</p>
+        </div>
+      </section>
+
+      <!-- ============ LANDED ============ -->
+      <section id="landed" class="space-y-4">
+        <h2 class="font-serif text-3xl border-b border-stone-300 pb-3">Landed</h2>
+        <p class="text-sm text-slate-600">One line each. What they built is described in <a class="underline" href="architecture-map.html">the module map</a>; why, in the ADR.</p>
+        <div class="overflow-x-auto">
+          <table class="w-full text-sm border-collapse">
+            <thead>
+              <tr class="text-left text-xs uppercase tracking-wider text-slate-500 border-b border-stone-300">
+                <th class="py-2 pr-3">#</th><th class="py-2 pr-3">Candidate</th><th class="py-2 pr-3">Result</th><th class="py-2">Record</th>
+              </tr>
+            </thead>
+            <tbody class="align-top">
+              <tr class="border-b border-stone-200"><td class="py-2 pr-3 font-mono">1</td><td class="py-2 pr-3">Lift the tile pipeline out of the contact matrix view</td><td class="py-2 pr-3"><span class="font-mono">ImageTileSource</span>, a four-method interface over cache and colour scale. The target shape for render-path work.</td><td class="py-2 font-mono text-xs">#428</td></tr>
+              <tr class="border-b border-stone-200"><td class="py-2 pr-3 font-mono">2</td><td class="py-2 pr-3">Delete the event bus; keep the coordinator</td><td class="py-2 pr-3">Internal traffic removed, but <strong>the buses were kept</strong>: both are consumer API.</td><td class="py-2 font-mono text-xs"><a class="underline" href="adr/0002-keep-browser-coordinator.md">ADR-0002</a> · #414</td></tr>
+              <tr class="border-b border-stone-200"><td class="py-2 pr-3 font-mono">3</td><td class="py-2 pr-3">Collapse the pass-through modules around HICBrowser</td><td class="py-2 pr-3">Two forwarding modules deleted. The member-count target was dropped: some of those members are consumer API.</td><td class="py-2 font-mono text-xs">#467 · #468</td></tr>
+              <tr class="border-b border-stone-200"><td class="py-2 pr-3 font-mono">4</td><td class="py-2 pr-3">Give the browser registry an owner</td><td class="py-2 pr-3"><span class="font-mono">BrowserRegistry</span>, one per container element; two embeds can share a page.</td><td class="py-2 font-mono text-xs"><a class="underline" href="adr/0004-browser-registry-per-container.md">ADR-0004</a></td></tr>
+              <tr class="border-b border-stone-200"><td class="py-2 pr-3 font-mono">8</td><td class="py-2 pr-3">Give the browser a teardown that matches its construction</td><td class="py-2 pr-3"><span class="font-mono">dispose()</span> is the one teardown at browser and registry level.</td><td class="py-2 font-mono text-xs"><a class="underline" href="adr/0005-browser-teardown-contract.md">ADR-0005</a></td></tr>
+              <tr class="border-b border-stone-200"><td class="py-2 pr-3 font-mono">5</td><td class="py-2 pr-3">One decoder for session and URL</td><td class="py-2 pr-3"><span class="font-mono">decodeSession</span> behind wire-format adapters, gated by a golden corpus. The format is a contract with users.</td><td class="py-2 font-mono text-xs"><a class="underline" href="adr/0006-session-wire-format-and-one-decoder.md">ADR-0006</a> · <a class="underline" href="adr/0011-session-string-is-the-cross-host-contract.md">0011</a></td></tr>
+              <tr class="border-b border-stone-200"><td class="py-2 pr-3 font-mono">9</td><td class="py-2 pr-3">Give the config schema one reader</td><td class="py-2 pr-3"><span class="font-mono">normalizeSession</span> runs once, at the entry; the schema is <a class="underline" href="config-schema.md">written down</a>.</td><td class="py-2 font-mono text-xs"><a class="underline" href="adr/0008-figuremode-absorbs-minimode.md">ADR-0008</a></td></tr>
+              <tr><td class="py-2 pr-3 font-mono">6</td><td class="py-2 pr-3">Fold StateManager into State, and make restore use the chokepoint</td><td class="py-2 pr-3"><span class="font-mono">StateManager</span> deleted; restore is a translator; the state has one writer.</td><td class="py-2 font-mono text-xs"><a class="underline" href="adr/0009-restore-is-a-translator.md">ADR-0009</a></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- ============ BUGS ============ -->
+      <section id="bugs" class="space-y-4">
+        <h2 class="font-serif text-3xl border-b border-stone-300 pb-3">Defects surfaced incidentally</h2>
+        <p class="text-sm text-slate-600">Found while scanning, not themselves the recommendation. Four of the original five are fixed or went with the code they lived in. One is still live, checked against <span class="font-mono">v4.4.0</span>:</p>
+        <div class="rounded-lg border border-red-300 bg-red-50 p-4 text-sm space-y-1">
+          <div class="font-semibold text-red-900">Session compression truncates any character above U+00FF — <em>not filed</em></div>
+          <p class="text-slate-700"><span class="font-mono">encodeSessionString</span> (<span class="font-mono">js/sessionCodec.js</span>) hands raw JSON to igv-utils' <span class="font-mono">BGZip.compressString</span>, which does <span class="font-mono">charCodeAt</span> into a <span class="font-mono">Uint8Array</span> — a mod-256 truncation. The payload carries user free text (captions, dataset and track names), so a curly quote or an em-dash yields a shared link that restores with the wrong characters.</p>
+        </div>
+      </section>
+
+      <section id="caveats" class="space-y-4 border-t border-stone-300 pt-8">
+        <h3 class="font-serif text-xl">Reading this report now</h3>
+        <p class="text-sm text-slate-600">What has drifted since the review was written. The stable vocabulary is in <a href="#legend" class="underline decoration-slate-400 underline-offset-2">How to read this report</a>.</p>
+        <ul class="text-sm space-y-2 list-disc list-inside">
+          <li><strong>The three open cards were written 31 July 2026 against <span class="font-mono">7d9fd11</span>.</strong> Their line counts and file lists were re-checked against <span class="font-mono">v4.4.0</span> on 10 September; their diagrams were not redrawn. The claims each rests on still hold.</li>
+          <li><strong>Rendering, gestures and dataset loading are still verified mostly by hand</strong>, and <a class="underline" href="adr/0013-no-browser-level-test-automation.md">ADR-0013</a> declined browser-level automation. So for all three open cards, what pins today's behaviour before anything moves is the first question, not the last.</li>
+          <li><strong>Check the tracker before treating a card as new work.</strong> This document is a snapshot of code, not of the tracker.</li>
+        </ul>
+      </section>
+
+      <footer class="text-xs text-slate-400 pt-8 border-t border-stone-200">
+        <strong>How this document is kept.</strong> It is the one review for this repo and is revised in place; a new scan adds cards here. When a candidate lands, its card is replaced by one row in <a href="#landed">Landed</a> — what it produced and where the decision is recorded. The history of how it landed belongs in its ADR and its issues, not here.
+        <br><br>
+        Cards written from reads of <span class="font-mono">js/</span> at <span class="font-mono">6035e34</span> (30 July 2026, render path) and <span class="font-mono">7d9fd11</span> (31 July, lifecycle &amp; session). Pruned to the open backlog on 10 September 2026; the full history of the eight landed cards is in git.
+      </footer>
+
+    </main>
+  </body>
+</html>

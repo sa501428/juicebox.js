@@ -1,0 +1,554 @@
+/**
+ * The golden-file characterization test for the resolved config. #531.
+ *
+ * **Nothing in the config-handling code moves until this file is green.** It is
+ * candidate 9's gate, and it is the same instrument #503 was for candidate 5:
+ * drive representative inputs through every entry path, snapshot what comes out,
+ * and let the refactor pass by coming back byte-identical.
+ *
+ * ## What is snapshotted, and why it is two things
+ *
+ * Each fixture is driven through the four entry paths a config can arrive by,
+ * and each path contributes two records:
+ *
+ * - **`atConstruction`** — the config as it reaches `HICBrowser`, captured at
+ *   `HICBrowser.prototype.init` (the constructor assigns `this.config` and does
+ *   not rewrite it, so the two are the same object one line apart). This is
+ *   everything the normalizers upstream of the browser did.
+ * - **`readBack`** — `browser.config` off the live instance afterwards, plus the
+ *   two members the browser derives from a config rather than storing
+ *   (`figureMode`, `synchable`). juicebox-web reads `browser.config` back
+ *   (ADR-0003), so the resolved config is an *observable surface*: a change to
+ *   it is consumer-visible whether or not any juicebox code notices. The pair
+ *   also catches `init()` writing to the host's own object -- `config.displayMode
+ *   = "A"` at hicBrowser.js:217 is one such write.
+ *
+ * `sameObjectAsInput` is snapshotted beside them because none of this is copied:
+ * every normalizer mutates in place, so the host's own object is the browser's
+ * config. A refactor that starts returning a normalized *copy* is a behaviour
+ * change for a host that holds a reference, and this is the line that catches it.
+ *
+ * ## Why one snapshot holds all four paths
+ *
+ * Because the divergences are the point. No file in this repo states what a
+ * config contains; four modules each interpret a subset, and the entry paths
+ * have silently diverged. Putting the paths side by side in one snapshot turns
+ * "the paths disagree" from a claim in a review card into a difference between
+ * two columns of a committed file. Where a fixture exists to expose one, its
+ * `divergence` note in `test/data/configEntryPathCorpus.js` says which -- and
+ * names the ticket expected to close it.
+ *
+ * ## Updating a snapshot — the convention
+ *
+ * Unchanged from #503, and it applies here for the same reason: a bare
+ * `vitest -u` is exactly what makes a deliberate movement and an accidental one
+ * indistinguishable.
+ *
+ * 1. Read the diff fixture by fixture. A column you did not expect to move is a
+ *    bug report, not a snapshot to accept.
+ * 2. Update only what moved -- `vitest -u -t '<fixture id>'`, never a bare `-u`.
+ * 3. Add a row to the log below naming the ticket that authorised it.
+ *
+ * ### Authorised snapshot movements
+ *
+ * | Date | Fixtures | Authorised by |
+ * |------|----------|---------------|
+ * | 2026-08-10 | all — baseline taken | #531. No production code changed; this is the gate, taken before candidate 9 moves anything. |
+ * | 2026-08-10 | `host-shaped-full-config`, `track-carrying-the-defaults-fixDefaults-strips`, `url-shortcuts-in-map-control-and-track`, `session-with-url-shortcuts-in-both-browsers` (both suites), `the-same-track-through-a-URL-and-through-a-config` | **#533**, the track-default move. `fixDefaults` ran inside the decoder, so the four config-shaped doors skipped it; it is `normalizeSession.applyTrackDefaults` now and they all meet it. Every one of these fixtures carries a track, and every moved line is one of three: a `displayMode: "COLLAPSED"` gained, the default annotation colour dropped, a `NaN` data-range bound dropped. The query columns did not move — the same defaults, one stage later. The probe is the one to read: its two sides now agree, which is what the fixture was written to expose. |
+ * | 2026-08-11 | `url-shortcuts-in-map-control-and-track`, `session-with-url-shortcuts-in-both-browsers` (session suite only) | **#534**, the duplicate shortcut expansion. Only the two doors that never expanded move — `createBrowser` and `createBrowserList` reached directly — and every moved line is a `*s3/`, `*s3e_/`, `*s3e/` or `*enc/` prefix becoming the URL it always stood for. The two registry-restore columns and the whole Spacewalk suite are byte-identical, because they expanded already; `the-same-shortcut-URL-through-a-URL-and-through-a-config` is byte-identical too, which is the probe saying the two sides still agree with one copy of the code producing both. **This is a divergence closing, not a behaviour change**: the fixture's note has said since #531 that these two columns hand an unexpanded `*s3/…` to the loader, and #534 is the ticket that stops them. |
+ * | 2026-08-10 | `syncDatasets-false-on-a-single-browser-config` | **#533**, the `syncDatasets` resolution. Only the `createBrowser` column moves, and only in `synchable`: the session-level opt-out is resolved in normalize now, so the door that takes one browser config honours it as the door that takes a list always did. The three columns that already honoured it are byte-identical. |
+ * | 2026-08-11 | **all fixtures**, in two fields; plus `mini-mode-the-legacy-spelling-of-figure-mode` and `synth-query-every-parameter` | **#536**, the downstream readers. Three kinds of movement and nothing else — the whole diff was tallied line by line before the update. (1) Every config gains **`synchable: true`** and a **`backgroundColor: {r: 255, g: 255, b: 255}`**: those were `HICBrowser`'s `config.synchable !== false` and `createWidgets`' `browser.config.backgroundColor \|\| ContactMatrixView.defaultBackgroundColor`, and a default a reader keeps to itself is a field `browser.config` cannot answer for. They are `normalizeSession`'s now, so they are *in* the config. No behaviour moved: the `readBack` `synchable` column is unchanged everywhere, including the two fixtures that opt out. (2) The **mini-mode** fixture moves in the three display flags and gains `figureMode: true` — the one *behavioural* movement, and the divergence this fixture was written to expose: `browser.figureMode` was true while the flags defaulted on as though it were not. `miniMode` resolves into `figureMode` now, so a mini map is a figure at every reader. (3) `synth-query-every-parameter` moves `displayMode` from `"AOB"` to `"A"` **at construction only** — `init()` overwrote it one line later, so `readBack` said `"A"` before and says `"A"` now. The write moved up a stage; nothing about it changed. |
+ * | 2026-08-11 | `harvested-query-wapl-wt`, `harvested-query-wapl-ko`, `harvested-query-gm12878-nvi`, `harvested-query-degron-fully-encoded`, `synth-query-colorscale-bare-threshold` | **#514**, the bare-threshold colour scale. Every moved fixture carries a `colorScale` of a threshold and nothing else, and every moved line is one of three: `r: undefined` → `255`, `g: undefined` → `0`, `b: undefined` → `0`. Those are `defaultColorScaleConfig`, which the decoder defined and never consulted, so the bare form painted `rgba(undefined,undefined,undefined,alpha)`. **This is not a change to the wire format.** The same inputs decode, to the same document, with the same threshold; what changed is the colour a component the string never supplied resolves to — from unpaintable to the default red. No fixture without a bare `colorScale` moved, and no other field moved in the five that did. |
+ * | 2026-08-24 | `session-gzip-data-uri` — one entry **added**, none moved | **#518**, ADR-0011 decision 2. The corpus fixture that used to reject now decodes, so this suite — which runs the decoding fixtures — sees it for the first time. An addition rather than a movement: a fixture with no prior entry has nothing to disagree with. The decoded session is one browser naming `https://example.org/a.hic`, which is what the fixture's note has always said its payload holds. Logged so that "one new entry and nothing else changed" is a claim a reader of the diff can check; the movement itself is logged in `testDecoderGolden.js`. |
+ *
+ * @see test/data/configEntryPathCorpus.js — the inputs and their divergence notes
+ * @see test/testDecoderGolden.js — the same instrument, one seam upstream
+ */
+import {afterEach, beforeEach, describe, expect, test, vi} from 'vitest'
+import {igvxhr} from 'igv-utils'
+import HICBrowser from '../js/hicBrowser.js'
+import DataLoader from '../js/dataLoader.js'
+import {init} from '../js/init.js'
+import {restoreSession} from '../js/session.js'
+import {createBrowser, createBrowserList} from '../js/createBrowser.js'
+import {normalizeSession} from '../js/normalizeSession.js'
+import {registryForContainer} from '../js/browserRegistry.js'
+import {withContainers} from './utils/browserFixture.js'
+import {withStubbedLoads} from './utils/stubbedLoads.js'
+import {configFixtures, divergenceProbes, sessionFixtures} from './data/configEntryPathCorpus.js'
+import {selfContained, viaLoader} from './data/wireFormatCorpus.js'
+
+/**
+ * The two loads `withStubbedLoads` does not cover, stubbed for the same reason
+ * it covers the others: they are the network, and a config fixture naming a
+ * control map or a normalization vector would otherwise go to the wire.
+ *
+ * Local to this file rather than added to the shared helper: no other suite
+ * drives a config with a control map, so putting these in `withStubbedLoads`
+ * would change what every existing suite stubs in order to serve one. (The
+ * `browserFixture` change in the same commit goes the other way because it is
+ * purely additive -- an extra return value and an extra method, nothing that
+ * alters what an existing caller sees.) What the stub reproduces is only what
+ * the config path downstream of it reads: `controlUrl` on the browser, and a
+ * dataset present enough for `isWholeGenome` and the resolution selector.
+ */
+function withStubbedControlLoads() {
+
+    beforeEach(() => {
+        vi.spyOn(DataLoader.prototype, 'loadHicControlFile').mockImplementation(async function (config) {
+            this.browser.controlUrl = config.url
+            this.browser.controlDataset = {
+                url: config.url,
+                name: config.name,
+                genomeId: 'hg19',
+                isWholeGenome: () => false,
+                bpResolutions: [2500000, 1000000],
+                isCompatible: () => true,
+            }
+        })
+        vi.spyOn(DataLoader.prototype, 'loadNormalizationFile').mockImplementation(async () => undefined)
+    })
+}
+
+/**
+ * A config rendered as plain, order-stable data.
+ *
+ * Three things this does that a raw `toMatchSnapshot()` of the object would not:
+ *
+ * 1. **Keys are sorted.** Insertion order is an artefact of which normalizer
+ *    wrote which field, and it differs between paths for reasons that are not
+ *    behaviour. Sorting makes the columns comparable by eye.
+ * 2. **Class instances keep their class.** `colorScale` arrives as a string on
+ *    one path and a `ColorScale` on another; `state` as a plain object from
+ *    `JSON.parse` and as a `State` from the query decoder. Those are different
+ *    values and the snapshot has to say so.
+ * 3. **Nothing calls `toJSON()`.** A wire projection would hide exactly the
+ *    fields a normalize stage is most likely to drop.
+ *
+ * `testDecoderGolden.js` reaches (2) and (3) with a snapshot serializer instead.
+ * The two are deliberately not shared: a serializer is installed on `expect` and
+ * so applies to everything a file snapshots, which is right there and wrong here
+ * -- this file snapshots a nested record where only the config subtrees want the
+ * treatment, and it wants sorted keys, which a serializer cannot add without
+ * changing how every other suite's objects print.
+ */
+function snapshotable(value) {
+
+    if (value === null || typeof value !== 'object') {
+        return typeof value === 'function' ? '[Function]' : value
+    }
+
+    if (Array.isArray(value)) {
+        return value.map(snapshotable)
+    }
+
+    const entries = Object.keys(value).sort().map(key => [key, snapshotable(value[key])])
+    const plain = Object.fromEntries(entries)
+
+    const className = value.constructor?.name
+    return className === undefined || className === 'Object'
+        ? plain
+        : {__class: className, ...plain}
+}
+
+/**
+ * What one browser looks like once a path has built it.
+ *
+ * `figureMode` and `synchable` are here because they are read off a config and
+ * stored. They were the evidence of the last two inline defaults until #536 —
+ * `browser.figureMode` was true for `miniMode` while `config.showLocusGoto` was
+ * defaulted as though it were not, and that disagreement was invisible in the
+ * config alone. Both are plain reads of a resolved field now, so each should
+ * equal what the config beside it says; kept in the record precisely so that a
+ * default creeping back into the constructor shows up as the two disagreeing.
+ */
+function describeBrowser(browser, input) {
+    return {
+        config: snapshotable(browser.config),
+        figureMode: browser.figureMode,
+        synchable: browser.synchable,
+        // Every normalizer mutates in place, so today this is `true` everywhere.
+        // It is snapshotted rather than asserted because "the host's object *is*
+        // the browser's config" is a property of the current design, not a
+        // requirement -- a normalize stage that copies would move this line, and
+        // that is a consumer-visible change worth arriving deliberately.
+        sameObjectAsInput: input === undefined ? undefined : browser.config === input,
+    }
+}
+
+/**
+ * The four ways a config reaches a browser.
+ *
+ * Three are doors -- published entry points a host calls. The fourth,
+ * `createBrowserList`, stopped being one at #535 and is now the builder the
+ * session-shaped doors end in; see its note below for why it stays in the table
+ * and what its driver has to do that the others do not.
+ *
+ * All four take a single browser config: `createBrowserList` reads
+ * `session.browsers || [session]`, so a bare config is a one-browser session,
+ * and `restoreSession` and `init` end in one of the two creation paths. That
+ * shared shape is what makes the four comparable.
+ *
+ * `init` navigates first: it consults `window.location.href` unless the host
+ * opts out, and a URL carrying no juicebox parameters is what a host app that
+ * embeds juicebox on an ordinary page presents. Setting
+ * `queryParametersSupported: false` instead would have put an extra field in
+ * every snapshot on one column only.
+ */
+const ENTRY_PATHS = [
+    {
+        name: 'hic.init(container, config)',
+        sessionShaped: true,
+        run: async (container, config, dom) => {
+            dom.navigate('http://localhost/host.html')
+            await init(container, config)
+        },
+    },
+    {
+        name: 'hic.restoreSession(container, session)',
+        sessionShaped: true,
+        run: async (container, config) => {
+            await restoreSession(container, config)
+        },
+    },
+    {
+        name: 'createBrowser(container, config)',
+        // The one path that takes a browser config and *only* a browser config:
+        // it builds one browser, so `browsers` and `syncDatasets` mean nothing
+        // to it. That is why it is excluded from the session suite -- and, since
+        // the exclusion is a claim about the path rather than about its name, it
+        // is a flag rather than a substring match on the caption.
+        sessionShaped: false,
+        run: async (container, config) => {
+            await createBrowser(container, config)
+        },
+    },
+    {
+        name: 'createBrowserList(container, session)',
+        sessionShaped: true,
+        // **Below the seam since #535**, and the one column here that is not a
+        // door: `createBrowserList` is internal, and it no longer normalizes --
+        // its one production caller, `BrowserRegistry.restoreSession`, does that
+        // before calling it. So the driver does what that caller does, and the
+        // column goes on characterizing what it always characterized: the config
+        // the *builder* hands a browser, which is where the other three columns
+        // end too. That is why these snapshots did not move when the call did.
+        //
+        // The normalize call belongs to the driver rather than to the path list
+        // because it is not part of what is being measured. `testNormalizeOnceAtTheEntry.js`
+        // is where the count lives, and it asserts this function normalizes
+        // nothing.
+        run: async (container, config) => {
+            await createBrowserList(container, normalizeSession(config))
+        },
+    },
+]
+
+const HOST_CONFIG_PATH = ENTRY_PATHS[0]
+
+const SESSION_PATHS = ENTRY_PATHS.filter(path => path.sessionShaped)
+
+/**
+ * The three things every suite below needs: containers, the loads a test cannot
+ * do, and the capture of what reached `HICBrowser`.
+ *
+ * One function rather than four repetitions of the same four lines, and it
+ * returns the two holders the tests read -- neither of which exists until
+ * `beforeEach` has run.
+ */
+function goldenSuite() {
+
+    const dom = withContainers()
+    withStubbedLoads()
+    withStubbedControlLoads()
+
+    return {dom, capture: captureConstructionConfigs()}
+}
+
+/**
+ * Drive one input through one path in a container of its own, and return both
+ * records as data -- including a rejection, which is as much a part of what a
+ * path does with a config as an acceptance is.
+ *
+ * The input is cloned per path because every normalizer mutates in place: two
+ * paths sharing a fixture object would have the first path's rewrites in the
+ * second path's input, and the divergence the snapshot is for would vanish.
+ */
+async function drive(path, dom, input, capture) {
+
+    const container = dom.another()
+    const clone = structuredClone(input)
+    const inputBrowsers = clone.browsers || [clone]
+
+    capture.take()
+
+    try {
+        await path.run(container, clone, dom)
+    } catch (e) {
+        return {outcome: 'throws', error: {name: e?.name, message: e?.message}}
+    }
+
+    const browsers = registryForContainer(container).browsers
+
+    return {
+        outcome: 'builds',
+        atConstruction: capture.take(),
+        readBack: browsers.map((browser, i) => describeBrowser(browser, inputBrowsers[i])),
+    }
+}
+
+/**
+ * The query path's counterpart to `drive`: navigate to `href`, initialize with
+ * the empty config a host that leaves the URL in charge passes, and return the
+ * same two records.
+ *
+ * `init(container, {})` rather than a call to `extractConfig`: what is being
+ * characterized is the whole path from the address bar to `browser.config`, and
+ * the decode half of it already has a golden file of its own.
+ */
+async function driveQuery(dom, href, capture) {
+
+    const container = dom.another()
+    capture.take()
+
+    dom.navigate(href)
+    await init(container, {})
+
+    return {
+        atConstruction: capture.take(),
+        readBack: registryForContainer(container).browsers.map(browser => describeBrowser(browser)),
+    }
+}
+
+/**
+ * Capture the config *as it reaches the browser*, before `init()` has had a
+ * chance to write to it.
+ *
+ * A spy rather than a constructor hook: the constructor assigns `this.config`
+ * and the very next thing any path does is `await browser.init(config)`, with
+ * the same object and nothing in between. Rendered immediately, because the
+ * object it holds is the one everything downstream then mutates.
+ *
+ * `take()` returns what has accumulated *and* clears it, so a driver never
+ * reaches into the captor's array to reset it: one path's browsers cannot leak
+ * into the next path's column, and there is one place that rule is written.
+ */
+function captureConstructionConfigs() {
+
+    let captured = []
+
+    beforeEach(() => {
+        captured = []
+        const original = HICBrowser.prototype.init
+        vi.spyOn(HICBrowser.prototype, 'init').mockImplementation(async function (config) {
+            captured.push(snapshotable(config))
+            return original.call(this, config)
+        })
+    })
+
+    return {
+        take() {
+            const taken = captured
+            captured = []
+            return taken
+        },
+    }
+}
+
+/**
+ * "Every entry path is covered" has to hold by construction, not by having been
+ * true the day it was written -- the same guard `testDecoderGolden.js` puts over
+ * its three partitions, and for the same reason: the one failure mode a golden
+ * file cannot survive is a case that stops being snapshotted in silence.
+ *
+ * The session suite runs a subset of the paths, so the subset is checked rather
+ * than assumed: exactly one path is not session-shaped, and it is the one that
+ * builds a single browser. A path added without a `sessionShaped` flag fails
+ * here instead of quietly running in one suite only.
+ */
+test('every entry path is driven, and the session subset is the one path short', () => {
+
+    expect(ENTRY_PATHS.map(path => path.name)).toEqual([
+        'hic.init(container, config)',
+        'hic.restoreSession(container, session)',
+        'createBrowser(container, config)',
+        'createBrowserList(container, session)',
+    ])
+
+    expect(ENTRY_PATHS.every(path => typeof path.sessionShaped === 'boolean'),
+        'a path with no sessionShaped flag would be dropped from the session suite in silence').toBe(true)
+
+    expect(ENTRY_PATHS.filter(path => !path.sessionShaped).map(path => path.name))
+        .toEqual(['createBrowser(container, config)'])
+
+    expect(SESSION_PATHS).toHaveLength(ENTRY_PATHS.length - 1)
+    expect(HOST_CONFIG_PATH.name).toBe('hic.init(container, config)')
+})
+
+/**
+ * A fixture id names a snapshot, so two fixtures sharing one would leave a
+ * single entry standing for both -- silently, and differently depending on
+ * which ran last.
+ */
+test('every fixture id is unique within its corpus', () => {
+    for (const corpus of [configFixtures, sessionFixtures, divergenceProbes]) {
+        expect(new Set(corpus.map(f => f.id)).size).toBe(corpus.length)
+    }
+})
+
+describe('resolved config golden file — one browser config, through every entry path', () => {
+
+    const {dom, capture} = goldenSuite()
+
+    for (const fixture of configFixtures) {
+        test(fixture.id, async () => {
+
+            const byPath = {}
+            for (const path of ENTRY_PATHS) {
+                byPath[path.name] = await drive(path, dom, fixture.config, capture)
+            }
+
+            expect(byPath).toMatchSnapshot()
+        })
+    }
+})
+
+describe('resolved config golden file — session documents, through the session-shaped paths', () => {
+
+    const {dom, capture} = goldenSuite()
+
+    for (const fixture of sessionFixtures) {
+        test(fixture.id, async () => {
+
+            const byPath = {}
+            for (const path of SESSION_PATHS) {
+                byPath[path.name] = await drive(path, dom, fixture.session, capture)
+            }
+
+            expect(byPath).toMatchSnapshot()
+        })
+    }
+})
+
+/**
+ * The Spacewalk sequence: `init(container, {})` first, then `restoreSession`
+ * into the *same* embed.
+ *
+ * The suites above give each path a container of its own, which is the right
+ * isolation for comparing columns and the wrong shape for the one host that
+ * matters most here. Spacewalk initializes with an empty config and drives
+ * everything through `restoreSession` afterwards, so its restore always lands on
+ * a registry that already holds a browser -- `deleteAll()` then rebuild, not a
+ * cold start. That re-entrancy is a different code path and gets its own
+ * snapshot.
+ *
+ * Both halves are recorded, because the interesting question is whether the
+ * second one is affected by the first having happened.
+ */
+describe('resolved config golden file — the Spacewalk sequence, restoring into a live embed', () => {
+
+    const {dom, capture} = goldenSuite()
+
+    for (const fixture of sessionFixtures) {
+        test(fixture.id, async () => {
+
+            const container = dom.another()
+
+            dom.navigate('http://localhost/host.html')
+            capture.take()
+            await init(container, {})
+
+            const afterInit = {
+                atConstruction: capture.take(),
+                readBack: registryForContainer(container).browsers.map(browser => describeBrowser(browser)),
+            }
+
+            const session = structuredClone(fixture.session)
+            await restoreSession(container, session)
+
+            const afterRestore = {
+                atConstruction: capture.take(),
+                readBack: registryForContainer(container).browsers
+                    .map((browser, i) => describeBrowser(browser, (session.browsers || [session])[i])),
+            }
+
+            expect({afterInit, afterRestore}).toMatchSnapshot()
+        })
+    }
+})
+
+/**
+ * The query/URL path, over the wire-format corpus rather than over fixtures
+ * invented here.
+ *
+ * #503 pins what `decodeSession` *returns*; what this pins is what happens to
+ * that value on its way to a browser -- the normalize stage's shortcut expansion
+ * and per-browser defaults, and the fields `HICBrowser` reads. The two golden files
+ * meet at `init.js:50`, and the corpus is deliberately the same one so that a
+ * fixture added there is covered on both sides of the seam.
+ *
+ * Only the fixtures that decode to a config are here: a `no-config` URL leaves
+ * the host's config in place, which is the `hic.init` column above, and a
+ * rejection never reaches a browser. Those are #503's to pin, and it does.
+ *
+ * The corpus's bare-query fixtures are given a base URL, since a page has one.
+ * `extractQuery` reads from the first `?`, so the base is not part of what is
+ * being characterized -- but it *is* part of what JSDOM parses, which is the
+ * other reason to navigate rather than to hand `extractConfig` a raw string:
+ * a URL a user pastes has been through a URL parser before juicebox sees it.
+ */
+describe('resolved config golden file — the query path, over the wire-format corpus', () => {
+
+    const {dom, capture} = goldenSuite()
+
+    const decoding = [...selfContained, ...viaLoader].filter(f => f.outcome === 'decodes')
+
+    beforeEach(() => {
+        // A tripwire, as in #503: nothing on this path should reach the network.
+        // The session-URL fixtures re-stub it with their own recorded response.
+        vi.spyOn(igvxhr, 'loadString').mockImplementation(async () => {
+            throw new Error('unexpected network access from the config golden-file suite')
+        })
+    })
+
+    for (const fixture of decoding) {
+        test(fixture.id, async () => {
+
+            if (fixture.loaderResponse !== undefined) {
+                vi.spyOn(igvxhr, 'loadString').mockImplementation(async () => fixture.loaderResponse)
+            }
+
+            const href = fixture.input.startsWith('?')
+                ? `http://localhost/juicebox/${fixture.input}`
+                : fixture.input
+
+            expect(await driveQuery(dom, href, capture)).toMatchSnapshot()
+        })
+    }
+})
+
+/**
+ * The divergences the four columns cannot show: query path against config path,
+ * on inputs that mean the same thing.
+ *
+ * A URL and a config are different types, so they cannot be two columns of the
+ * table above. Pairing them is the substitute -- and it is a real one, because
+ * the inputs are equivalent by construction, so anything that differs between
+ * the two answers was put there by a normalizer that only one path meets.
+ *
+ * @see test/data/configEntryPathCorpus.js — each probe's `divergence` note
+ */
+describe('resolved config golden file — the same input as a URL and as a config', () => {
+
+    const {dom, capture} = goldenSuite()
+
+    for (const probe of divergenceProbes) {
+        test(probe.id, async () => {
+
+            const viaQuery = await driveQuery(dom, probe.url, capture)
+            const viaHostConfig = await drive(HOST_CONFIG_PATH, dom, probe.config, capture)
+
+            expect({viaQuery, viaHostConfig}).toMatchSnapshot()
+        })
+    }
+})

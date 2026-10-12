@@ -1,0 +1,370 @@
+<html>
+<head>
+    <meta charSet="UTF-8"/>
+    <meta http-equiv="X-UA-Compatible" content="IE=edge"/>
+    <title>Juicebox - ES6 </title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+
+    <!-- Font Awesome CSS-->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/4.2.0/css/font-awesome.css">
+
+    <!-- Juicebox CSS-->
+        <link rel="stylesheet" type="text/css" href="../css/juicebox.css">
+<!--    <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/igvteam/juicebox.js@juicebox-llm-project/dist/css/juicebox.css">-->
+
+</head>
+
+<body>
+
+<div id="app-container"></div>
+
+<script type="module">
+
+    import juicebox from '../js/index.js';
+    import { devMapUrl } from '../dev-proxy/map-url.js'
+
+    // The one line a host app adds in development, routing .hic reads on hosts that answer
+    // localhost with a bot challenge through the dev server. In a host app it is guarded by
+    // import.meta.env.DEV; this page only ever runs under the dev server. See the README section
+    // "Loading maps from hosts that serve a bot challenge" and
+    // docs/adr/0001-dev-proxy-for-waf-protected-hosts.md.
+    juicebox.setUrlMapper(devMapUrl)
+
+    // ------------------------------------------------------------------
+    // FIXTURE ROT -- read before picking a config below.
+    //
+    // Historically every config in this file was unreachable from a browser.
+    // Two separate gates were at work:
+    //
+    //   encodeproject.org (405) -- AWS WAF answering a non-allowlisted Origin
+    //   with a CAPTCHA page. FIXED for .hic reads by the dev proxy registered
+    //   above: the Vite plugin fetches with an allowlisted Origin from Node and
+    //   hands the redirect back, so the bytes still stream straight to the
+    //   browser from S3.
+    //
+    //   hicfiles / s3.amazonaws.com/hicfiles / dnazoo (403) -- STILL BROKEN.
+    //   These gate on User-Agent, and User-Agent is a forbidden header name in
+    //   the Fetch spec, so hic-straw's headers['User-Agent'] = 'IGV' is
+    //   silently dropped by the browser. curl and Node succeed; the browser
+    //   cannot. See aidenlab/hic-straw#46. The symptom is a bare Error from
+    //   readHeaderAndFooter with no message, because statusText is empty on
+    //   HTTP/2 (hic-straw#47).
+    //
+    // Note the proxy covers only .hic reads through hic-straw. The 2D
+    // annotation .txt tracks on hicfiles are read by igv and are not routed, so
+    // an ENCODE map in a config below loads while its hicfiles tracks do not.
+    //
+    // Also verified reachable today: the wasabisys buckets, dropbox, and the
+    // igv.org.genomes / igv.broadinstitute.org buckets.
+    //
+    // hgdownload.soe.ucsc.edu once appeared unreachable over HTTPS -- it
+    // accepted the TCP connection but never completed the TLS handshake, so a
+    // track pointed at it hung until igv timed out. That was observed from one
+    // network location, not a property of the host: it returned 200 over HTTPS
+    // when re-probed on 2026-08-05. If it hangs for you, suspect your network
+    // path before changing these URLs -- UCSC is the canonical source for the
+    // refGene tracks and the URLs here should stay pointed at it.
+    //
+    // UCSC serves no tabix index for ncbiRefSeq.txt.gz -- the .tbi is 404 at
+    // both the hg19 and hg38 paths -- so these tracks must not set an indexURL.
+    // ------------------------------------------------------------------
+
+    // Map and 2D track both verified reachable. The pairing is the one used by
+    // bug-daphne-qin-vanishing-2d-annotation.html, so the genomes match --
+    // every reachable map here is hg38 (chr17 = 83,257,441), while the local
+    // combined_peaks.chr17.txt is hg19 and cannot be paired with them.
+    const config_smoke =
+        {
+            "url": "https://s3.us-east-1.wasabisys.com/aiden-suhas/hic_files/FINAL_GRCh38_processing/LCL/LCL_combined/9_12_23/inter_30.hic",
+            "name": "inter_30.hic",
+            "nvi": "2113712247631,126136",
+            "tracks": [
+                {
+                    "url": "https://www.dropbox.com/scl/fi/mweycro8eyhubrjrhv6oo/fosl1_loops_with_snps_nothresh.bedpe?rlkey=1dv8wbc7c57m9muob7tlxvm89&e=1&st=2c4adj56&dl=0",
+                    "name": "fosl1_loops_with_snps_nothresh.bedpe",
+                    "color": "#00fdff",
+                    "displayMode": "COLLAPSED"
+                }
+            ]
+        };
+
+    // A/B compare gate. The diploid pair from the same bucket -- both reachable,
+    // both hg38, and verified to carry identical resolution lists, so the zoom
+    // index translation between primary and control is the identity and AOB/BOA
+    // cannot throw at any zoom.
+    //
+    // This exercises the wiring: control dataset selection, the second
+    // getContactRecords call, and ratio scoring. It does NOT exercise the
+    // interesting branch of the translation, where the two maps carry different
+    // resolutions -- that path is covered by unit tests in
+    // test/testImageTileCore.js, and no verified-reachable mismatched pair is
+    // known.
+    //
+    // Switch displayMode to 'BOA' to check the swapped-role path. 'AMB' throws:
+    // diffColorScale has been unimplemented since 2018, see issue #426.
+    const config_ab_compare =
+        {
+            "url": "https://s3.us-east-1.wasabisys.com/aiden-suhas/hic_files/FINAL_GRCh38_processing/LCL/GM12878/diploid/r.hic",
+            "name": "r.hic",
+            "nvi": "43762184328,25419",
+            "controlUrl": "https://s3.us-east-1.wasabisys.com/aiden-suhas/hic_files/FINAL_GRCh38_processing/LCL/GM12878/diploid/a.hic",
+            "controlName": "a.hic",
+            "controlNvi": "43835341324,25419",
+            "displayMode": "AOB"
+        };
+
+    const config_erez_bug =
+        {
+            "browsers": [
+                {
+                    "backgroundColor": "255,255,255",
+                    "url": "https://s3.us-east-1.wasabisys.com/aiden-suhas/hic_files/FINAL_GRCh38_processing/LCL/LCL_combined/8_1_22/inter_30.hic/inter_30.hic",
+                    "name": "inter_30.hic",
+                    "state": "23,23,6,5052.633675000001,5049.383675000001,640,640,4,VC",
+                    "colorScale": "R:500:6.214608098422191,255,0,0:6.214608098422191,0,0,255",
+                    "nvi": "1373857641721,71224",
+                    "controlUrl": "https://www.encodeproject.org/files/ENCFF053VBX/@@download/ENCFF053VBX.hic",
+                    "controlName": "MboI primary+replicate GM12878 experiment",
+                    "displayMode": "AOB",
+                    "controlNvi": "54305946375,47429"
+                },
+                {
+                    "backgroundColor": "255,255,255",
+                    "url": "https://www.encodeproject.org/files/ENCFF053VBX/@@download/ENCFF053VBX.hic",
+                    "name": "MboI primary+replicate GM12878 experiment",
+                    "state": "23,23,6,5052.633675000001,5049.383675000001,640,640,4,VC",
+                    "colorScale": "84.58193578581977,255,0,0",
+                    "nvi": "54305946375,47429"
+                },
+                {
+                    "backgroundColor": "255,255,255",
+                    "url": "https://s3.us-east-1.wasabisys.com/aiden-suhas/hic_files/FINAL_GRCh38_processing/LCL/LCL_combined/8_1_22/inter_30.hic/inter_30.hic",
+                    "name": "inter_30.hic",
+                    "state": "23,23,6,5052.633675000001,5049.383675000001,640,640,4,VC",
+                    "colorScale": "52.98886154812313,255,0,0",
+                    "nvi": "1373857641721,71224"
+                }
+            ],
+            "caption": "left panel: deep lcl in situ hg19; middle panel: encode gm12878 in situ hg38 & deep lcl intact; right panel: encode gm12878 in situ hg38"
+        };
+
+    const config_locus_state_hacks = {
+        "url": "https://www.encodeproject.org/files/ENCFF799QGA/@@download/ENCFF799QGA.hic",
+        "name": "in-situ agar GM12878 MboI experiment",
+        // "locus": 'all'
+        // "locus": "18:28,504,357-29,748,974 18:28,504,357-29,748,974",
+    }
+
+    const config_multiple_browsers =
+        {
+            "browsers": [
+                {
+                    "locus": "egfr",
+                    width: 512,
+                    height: 512,
+                    "backgroundColor": "136,133,1",
+                    "url": "https://www.encodeproject.org/files/ENCFF473CAA/@@download/ENCFF473CAA.hic",
+                    "name": "browser - thing one",
+                    // "state": "17,17,8,12025.0154,12025.0154,640,640,1,NONE",
+                    "colorScale": "12,131,249,2",
+                    "selectedGene": "ace",
+                    "nvi": "1077514950,36479",
+                    "tracks": [
+                        {
+                            "url": "https://hicfiles.s3.amazonaws.com/hiseq/gm12878/in-situ/combined_peaks.txt",
+                            "name": "Rao & Huntley et al. | Cell 2014 | GM12878 combined loops",
+                            "color": "#ffce6e"
+                        },
+                        {
+                            "url": "https://hicfiles.s3.amazonaws.com/hiseq/huvec/in-situ/combined_peaks.txt",
+                            "name": "Rao & Huntley et al. | Cell 2014 | HUVEC combined loops",
+                            "color": "#ff39ff"
+                        }
+                    ]
+                },
+                {
+                    "locus": "egfr",
+                    width: 720,
+                    height: 720,
+                    "backgroundColor": "136,133,1",
+                    "url": "https://www.encodeproject.org/files/ENCFF473CAA/@@download/ENCFF473CAA.hic",
+                    "name": "browser - thing two",
+                    // "state": "17,17,8,12025.0154,12025.0154,640,640,1,NONE",
+                    "colorScale": "12,131,249,2",
+                    "selectedGene": "ace",
+                    "nvi": "1077514950,36479",
+                    "tracks": [
+                        {
+                            "url": "https://hicfiles.s3.amazonaws.com/hiseq/gm12878/in-situ/combined_peaks.txt",
+                            "name": "Rao & Huntley et al. | Cell 2014 | GM12878 combined loops",
+                            "color": "#ffce6e"
+                        },
+                        {
+                            "url": "https://hicfiles.s3.amazonaws.com/hiseq/huvec/in-situ/combined_peaks.txt",
+                            "name": "Rao & Huntley et al. | Cell 2014 | HUVEC combined loops",
+                            "color": "#ff39ff"
+                        }
+                    ]
+                }
+            ],
+            "selectedGene": "ace"
+        };
+
+    const config_2d_track =
+        {
+            "browsers":
+                [
+                    {
+                        width: 512,
+                        height: 512,
+                        "backgroundColor": "136,133,1",
+                        "url": "https://www.encodeproject.org/files/ENCFF473CAA/@@download/ENCFF473CAA.hic",
+                        "name": "in-situ agar GM12878 MboI experiment",
+                        "state": "17,17,8,12025.0154,12025.0154,640,640,1,NONE",
+                        "colorScale": "12,131,249,2",
+                        "selectedGene": "ace",
+                        "nvi": "1077514950,36479",
+                        "tracks":
+                            [
+                                {
+                                    "url": "https://hicfiles.s3.amazonaws.com/hiseq/gm12878/in-situ/combined_peaks.txt",
+                                    "name": "Rao & Huntley et al. | Cell 2014 | GM12878 combined loops",
+                                    "color": "#ffce6e"
+                                },
+                                {
+                                    "url": "https://hicfiles.s3.amazonaws.com/hiseq/huvec/in-situ/combined_peaks.txt",
+                                    "name": "Rao & Huntley et al. | Cell 2014 | HUVEC combined loops",
+                                    "color": "#ff39ff"
+                                }
+                            ]
+                    }
+                ],
+            "selectedGene": "ace"
+        };
+
+    const config =
+        {
+            "backgroundColor": "255,255,255",
+            // "url": "https://hicfiles.s3.amazonaws.com/hiseq/gm12878/dilution/combined.hic",
+
+            // TODO: Debugging map
+            "url": "https://www.encodeproject.org/files/ENCFF219YOB/@@download/ENCFF219YOB.hic",
+
+            "name": "Combined",
+            // "state": "17,17,8,12025.0154,12025.0154,640,640,1,NONE",
+            // "locus": "18:28,504,357-29,748,974 18:28,504,357-29,748,974",
+            // "locus": "18:28,504,357-29,748,974",
+            "locus": "egfr",
+            // "locus": "all",
+            "normalization": "NONE",
+            "colorScale": "66.20668236071833,255,0,0",
+        };
+
+    const config_with_tracks =
+        {
+            "backgroundColor": "255,255,255",
+            "url": "https://hicfiles.s3.amazonaws.com/hiseq/gm12878/dilution/combined.hic",
+            "name": "Combined",
+            "locus": "18:28,504,357-29,748,974 18:28,504,357-29,748,974",
+            "normalization": "VC_SQRT",
+            "colorScale": "66.20668236071833,255,0,0",
+            "tracks": [
+                {
+                    "url": "https://hgdownload.soe.ucsc.edu/goldenPath/hg19/database/ncbiRefSeq.txt.gz",
+                    "type": "annotation",
+                    "format": "refgene",
+                    "name": "Refseq Genes",
+                },
+                {
+                    "url": "https://www.encodeproject.org/files/ENCFF144KUK/@@download/ENCFF144KUK.bigWig",
+                    "type": "wig",
+                    "format": "bigwig",
+                    "name": "Homo sapiens GM12878 CTCF "
+                },
+                {
+                    "url": "https://hicfiles.s3.amazonaws.com/hiseq/gm12878/in-situ/combined_peaks.txt",
+                    "name": "Rao & Huntley et al. | Cell 2014 | GM12878 combined loops"
+                },
+                {
+                    "url": "https://hicfiles.s3.amazonaws.com/hiseq/hap1/in-situ/combined_peaks.txt",
+                    "name": "Sanborn & Rao et al. | PNAS 2015 | Hap1 loops",
+                    "color": "#fffa03",
+                    "displayMode": "upper"
+                },
+                {
+                    "url": "https://hicfiles.s3.amazonaws.com/external/mumbach/GSE80820_HiChIP_GM_cohesin_peaks.txt",
+                    "name": "Mumbach Rubin Flynn et al. | Nature Methods 2016 | GM12878 cohesin combined loops",
+                    "color": "#000000",
+                    "displayMode": "lower"
+                }
+            ]
+        };
+
+    const config_a_b_maps =
+        {
+            "browsers": [
+                {
+                    "backgroundColor": "0,74,136",
+                    "url": "https://hicfiles.s3.amazonaws.com/hiseq/imr90/in-situ/combined.hic",
+                    "name": "Combined",
+                    "state": "7,7,5,815.66029,815.66029,640,640,1,NONE",
+                    "colorScale": "23,255,114,110",
+                    "selectedGene": "egfr",
+                    "nvi": "13433880319,35723",
+                    "controlUrl": "https://s3.amazonaws.com/hicfiles/hiseq/degron/untreated/unsynchronized/HIC005.hic",
+                    "controlName": "Untreated, HIC005",
+                    "displayMode": "B",
+                    "controlNvi": "6846576837,36479"
+                }
+            ],
+            "selectedGene": "egfr"
+        };
+
+    // Swap the second argument. Loading today:
+    //   config_smoke              -- one map plus a 2D annotation track
+    //   config_ab_compare         -- A/B ratio compare (AOB), the only working A/B gate
+    //   config_locus_state_hacks  -- ENCODE map, via the dev proxy
+    //   config_2d_track,
+    //   config_multiple_browsers  -- ENCODE maps load via the dev proxy; their
+    //                                hicfiles .txt tracks still 403
+    // config_with_tracks and config_a_b_maps point at hicfiles maps, which
+    // reject browsers outright; see the note at the top of this script.
+    juicebox.init(document.getElementById("app-container"), config_a_b_maps)
+        .then(browser => {
+
+            if (Array.isArray(browser)) {
+                for (const b of browser) {
+                    console.log(`${b.id} is good to go`)
+                }
+
+            } else {
+                console.log(`${browser.id} is good to go`)
+            }
+
+            // const result = browser.toJSON()
+
+            // console.log(`${ JSON.stringify(result, null, 2) }`)
+
+        })
+
+
+    function listClassMethods(classInstance) {
+        const prototype = Object.getPrototypeOf(classInstance);
+
+        // Get all property names of the prototype
+        const propertyNames = Object.getOwnPropertyNames(prototype);
+
+        // Filter the property names to only include methods
+        const methods = propertyNames.filter(property => {
+            return typeof prototype[property] === 'function' && property !== 'constructor';
+        });
+
+        console.log(`Methods of the class:`, methods);
+        return methods;
+    }
+
+</script>
+
+</body>
+
+</html>

@@ -1,0 +1,44 @@
+<html>
+<head>
+    <meta charSet="UTF-8"/>
+    <meta http-equiv="X-UA-Compatible" content="IE=edge"/>
+    <title>Juicebox - ES6 </title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+
+    <!-- Font Awesome CSS-->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/4.2.0/css/font-awesome.css">
+
+    <!-- Juicebox CSS-->
+    <link rel="stylesheet" href="../css/juicebox.css">
+
+</head>
+
+<body>
+
+<div id="app-container"></div>
+
+<script type="module">
+
+import juicebox from '../js/index.js';
+import { devMapUrl } from '../dev-proxy/map-url.js'
+
+// Dev-only: routes .hic reads on hosts that answer localhost with a bot challenge
+// (encodeproject.org today) through the dev server's proxy. In a host app this is
+// guarded by import.meta.env.DEV; these pages only run under the dev server. See the
+// README, "Loading maps from hosts that serve a bot challenge".
+juicebox.setUrlMapper(devMapUrl)
+
+const config =
+        {
+            "url": "https://www.encodeproject.org/files/ENCFF718AWL/@@download/ENCFF718AWL.hic",
+        }
+
+        const browser = await juicebox.init(document.getElementById("app-container"), config)
+        console.log(`${browser.id} is good to go`)
+
+
+</script>
+
+</body>
+
+</html>

@@ -25,139 +25,325 @@
  * @author Jim Robinson
  */
 
-import igv from './igv/igv.js'
-import {Alert} from '../node_modules/igv-ui/dist/igv-ui.js'
-import {DOMUtils, FileUtils, TrackUtils} from '../node_modules/igv-utils/src/index.js'
-import $ from '../vendor/jquery-3.3.1.slim.js'
+import {InputDialog, DOMUtils} from 'igv-ui'
 import * as hicUtils from './hicUtils.js'
-import {Globals} from "./globals.js";
-import EventBus from "./eventBus.js";
-import Track2D from './track2D.js'
-import LayoutController, {getNavbarContainer, getNavbarHeight, trackHeight} from './layoutController.js'
-import HICEvent from './hicEvent.js'
-import Dataset from './hicDataset.js'
-import Genome from './genome.js'
-import State from './hicState.js'
-import geneSearch from './geneSearch.js'
-import LocusGoto from "./hicLocusGoto.js";
-import ResolutionSelector from "./hicResolutionSelector.js";
-import ColorScaleWidget from "./hicColorScaleWidget.js";
-import ControlMapWidget from "./controlMapWidget.js";
-import NormalizationWidget from "./normalizationWidget.js";
-import ChromosomeSelectorWidget from "./chromosomeSelectorWidget.js";
-import AnnotationWidget from "./annotationWidget.js";
-import SweepZoom from "./sweepZoom.js";
-import ScrollbarWidget from "./scrollbarWidget.js";
-import ContactMatrixView from "./contactMatrixView.js";
-import ColorScale, {defaultColorScaleConfig} from "./colorScale.js";
-import RatioColorScale, {defaultRatioColorScaleConfig} from "./ratioColorScale.js";
-import {getAllBrowsers, syncBrowsers} from "./createBrowser.js";
-import {InputDialog} from '../node_modules/igv-ui/dist/igv-ui.js'
-import {isFile} from "./fileUtils.js"
+import EventBus from "./eventBus.js"
+import LayoutController, {setViewportSize} from './layoutController.js'
+import { geneSearch } from './geneSearch.js'
+import {registryForContainer} from "./browserRegistry.js"
+import {setTrackReorderArrowColors} from "./trackPair.js"
+import createWidgets from "./createWidgets.js"
+import BrowserCoordinator from "./browserCoordinator.js"
+import InteractionHandler from "./interactionHandler.js"
+import DataLoader from "./dataLoader.js"
+import {normalizeTrackConfigs} from "./normalizeSession.js"
+import {unmappedUrl, unmappedIndexUrl} from "./urlMapper.js"
+import {isSynchable, canResolveSyncState} from "./syncGroup.js"
+import {SENTINEL_ZOOM} from "./sentinelZoom.js"
+import {substitutionReason} from "./normalizationWidget.js"
+import {locusAtPixel, placeLocus} from "./crosshairsLocus.js"
+import HICEvent from "./hicEvent.js"
 
 const DEFAULT_PIXEL_SIZE = 1
-const MAX_PIXEL_SIZE = 12;
-const DEFAULT_ANNOTATION_COLOR = "rgb(22, 129, 198)";
+const MAX_PIXEL_SIZE = 128
+
+/**
+ * Thrown when a published method is called on a browser that has been disposed.
+ *
+ * Named, and exported, because it is the one behavioural change in #493 a host
+ * can observe: `dispose()` leaves a zombie the host may still hold -- juicebox-web
+ * holds `browser` across several call sites -- and decision 6 of ADR-0005 is
+ * that this fails visibly rather than drifting. An exception appears in the
+ * host's console in development; a silent no-op appears as a blank panel in
+ * production.
+ */
+class DisposedBrowserError extends Error {
+
+    constructor(browserId, methodName) {
+        super(`${browserId}.${methodName}() was called after dispose()`)
+        this.name = 'DisposedBrowserError'
+    }
+}
+
+/**
+ * The session entry of a 1D track, or `undefined` when it names nothing a
+ * session can reload.
+ *
+ * @param {Object} config - what the track was loaded from
+ * @param {{name, dataRange, color}} look - what the track shows: the loaded
+ *   igv track itself, or for a pending track what its config asks for
+ */
+function sessionTrack(config, {name, dataRange, color}) {
+
+    // The original URL, not the one igv was given: with a dev proxy registered those
+    // differ, and a session must never carry a dev-server path. See issue #450.
+    const url = unmappedUrl(config)
+
+    if (typeof url === "string") {
+
+        const t = {url}
+
+        // The index is what makes a track random-access. Dropped, the
+        // reload does not fail -- it downgrades to a whole-file read,
+        // and only stalls once the view is zoomed in far enough for igv
+        // to ask for data. A session saved at 1kb over `hg38.fa` was
+        // fetching the whole three-gigabyte FASTA on restore, and never
+        // finishing; the same session saved zoomed out restored fine,
+        // because nothing had asked the sequence track for anything yet
+        // (#584).
+        const indexURL = unmappedIndexUrl(config)
+        if (typeof indexURL === "string") {
+            t.indexURL = indexURL
+        }
+
+        if (config.type) {
+            t.type = config.type
+        }
+        if (config.format) {
+            t.format = config.format
+        }
+        if (name) {
+            t.name = name
+        }
+        if (dataRange) {
+            t.min = dataRange.min
+            t.max = dataRange.max
+        }
+        if (color) {
+            t.color = color
+        }
+        return t
+    } else if ('sequence' === config.type) {
+        return {type: 'sequence', format: 'sequence'}
+    }
+}
+
+/**
+ * What a pending track will show, read off its config: a data range whenever
+ * the config sets either end of one, so neither is lost in a mid-load save.
+ * An autoscaled track has no range yet; it gets one only once igv loads it.
+ */
+function pendingTrackLook({config, track}) {
+    return {
+        name: track.name,
+        dataRange: config.min === undefined && config.max === undefined ? undefined : {min: config.min, max: config.max},
+        color: config.color
+    }
+}
 
 class HICBrowser {
 
-    constructor($app_container, config) {
+    /**
+     * Set by `dispose()`, read by the guard on every published method. Private
+     * so that "is this browser alive?" is not itself published surface -- a
+     * host that wants to know is a host that has kept a zombie.
+     */
+    #disposed = false
 
+    /**
+     * The view in force -- chromosomes, zoom, bin origin, pixel size.
+     *
+     * Private, and that is the whole of #563's behaviour change: the field is
+     * readable through `state` and its `activeState` alias, and **the field**
+     * is written only by `setState`, the chokepoint. The setters that used to
+     * stand beside those getters were commented "direct assignment bypasses
+     * validation" and had no production caller (ADR-0009 fact 2); reading is
+     * plausible host behaviour and stays, writing is not and goes (decision 7).
+     *
+     * The field, not the object. The getter hands back the live `State`, so
+     * `browser.state.normalization = x` still writes canonical state from
+     * outside -- and three production sites do exactly that: `init`, and the two
+     * mid-render callers that both reach it through `substituteNormalization`
+     * below (#600). `normalization` is not one of the canonical six and
+     * `setView` does not take it; what it has instead is one enforcer,
+     * `#resolveNormalization`. See `docs/state-manipulation.md`.
+     */
+    #state
+
+    /**
+     * What this panel's crosshairs are following, if anything: `{pointer}`
+     * while it is the source (with `published`, the position last sent out), `{locus}` while it shows an echo. Held so a view
+     * change can re-place them -- see `#refreshCrosshairs`.
+     */
+    #crosshairs
+
+    /**
+     * Whether the host has been told of crosshairs it has not yet been told
+     * are hidden. Not the same as being the source: a source showing the
+     * whole-genome view draws and echoes, and tells the host nothing.
+     */
+    #hostHasCrosshairs = false
+
+    /** Whether `setCustomCrosshairsHandler` has said it is deprecated. */
+    #warnedOfCrosshairsHandler = false
+
+    constructor(appContainer, config) {
+        this.#construct(appContainer, config);
+    }
+
+    /**
+     * Everything a browser is made of, in one method so that `reset()` can run
+     * it a second time on the same instance. Decision 1 of ADR-0005: the
+     * dispose-and-reconstruct happens *inside* the object, so a host reference
+     * taken before a reset is still a live browser after it.
+     *
+     * The contract with `dispose()` is that this is the list it undoes. A field
+     * installed here that outlives a `dispose()` is a leak; a field assigned
+     * anywhere *else* survives a reconstruction, which is why
+     * `customCrosshairsHandler` is named here even though its value is nothing.
+     *
+     * @param {string} [id] - the identity to build under. Only `reset()` passes
+     *   one, and it passes the browser's existing id. Element ids are minted
+     *   from it here, so a reconstruction that took a fresh guid and had it
+     *   overwritten afterwards would leave the browser named differently from
+     *   its own DOM.
+     */
+    #construct(appContainer, config, id = `browser_${DOMUtils.guid()}`) {
+
+        // The back-pointer, per decision 9 of ADR-0004: `setCurrentBrowser` and
+        // `deleteBrowser` are handed a browser and nothing else, so this is how
+        // they find the registry to act on. Set here rather than by whoever
+        // registers the browser, so it holds for a browser's whole life --
+        // including during `init()`, which loads a dataset and so consults it.
+        this.registry = registryForContainer(appContainer);
+
+        // Read, not decided: everything below the entry seam takes the config as
+        // `normalizeSession` resolved it. `figureMode` absorbed the legacy
+        // `miniMode` spelling there in #536; this line used to be the `||` that
+        // did it, and was the only reader that thought a mini map was a figure.
         this.config = config;
-        this.figureMode = config.figureMode || config.miniMode;    // Mini mode for backward compatibility
+        this.figureMode = config.figureMode;
         this.resolutionLocked = false;
         this.eventBus = new EventBus();
 
         this.showTrackLabelAndGutter = true;
 
-        this.id = `browser_${DOMUtils.guid()}`;
+        this.id = id;
         this.trackPairs = [];
         this.tracks2D = [];
         this.normVectorFiles = [];
 
-        this.synchable = config.synchable !== false;
-        this.synchedBrowsers = [];
+        // Stub for igv@3 compatibility — FeatureTrack rendering reads
+        // browser.qtlSelections.hasPhenotype(). Juicebox doesn't do QTL.
+        this.qtlSelections = { hasPhenotype: () => false, isEmpty: () => true };
+
+        // Stub for igv@3 compatibility — SequenceTrack reads browser.nucleotideColors[base].
+        this.nucleotideColors = {
+            "A": "rgb(  0, 200,   0)", "a": "rgb(  0, 200,   0)",
+            "C": "rgb(  0,   0, 200)", "c": "rgb(  0,   0, 200)",
+            "T": "rgb(255,   0,   0)", "t": "rgb(255,   0,   0)",
+            "G": "rgb(209, 113,   5)", "g": "rgb(209, 113,   5)",
+            "N": "rgb( 80,  80,  80)", "n": "rgb( 80,  80,  80)",
+        };
+
+        // `config.synchable !== false` until #536, which is a default and so
+        // belongs to the stage that defaults. The session-level `syncDatasets`
+        // opt-out is resolved into this same field up there.
+        this.synchable = config.synchable;
+        this.synchedBrowsers = new Set();
+
+        // The three fields `StateManager` used to hold, held plainly (#563,
+        // ADR-0009 decisions 7 and 8). It was twelve methods, eight of them
+        // field get/set re-wrapped by ten accessors here; the four that carried
+        // behaviour left in #559 through #562, and what is left is a dataset, a
+        // state and a control dataset.
+        //
+        // `dataset` and `controlDataset` are writable fields because they were
+        // writable accessors; `#state` is private because the state is written
+        // in exactly one place, `setState`, the chokepoint. Declared here rather
+        // than only on first write so that `'state' in browser` is true from
+        // construction -- the public surface test asserts presence, not value.
+        this.dataset = undefined;
+        this.controlDataset = undefined;
+        this.#state = undefined;
 
         this.isMobile = hicUtils.isMobile();
 
-        this.$root = $('<div class="hic-root unselect">');
+        // Declared, not merely absent: `setCustomCrosshairsHandler` is the one
+        // published method that installs a field outside this method, and the
+        // handler it takes closes over the view a reconstruction throws away.
+        this.customCrosshairsHandler = undefined;
+        this.#crosshairs = undefined;
+        this.#hostHasCrosshairs = false;
 
-        if (config.width) {
-            this.$root.css("width", String(config.width));
+        /**
+         * Everything this browser installs *outside* `rootElement`'s subtree.
+         *
+         * Every delete path removes `rootElement` and nothing else, so a node
+         * put anywhere else is a node nobody removes. `inputDialog` is the only
+         * member today and was leaking one dialog per browser per session
+         * restore; the record is the point rather than the dialog, so that a
+         * field added to this constructor has one obvious place to add its
+         * cleanup. Decision 4 of ADR-0005.
+         */
+        this.externalElements = [];
+
+        this.rootElement = document.createElement('div');
+        this.rootElement.className = 'hic-root unselect';
+        appContainer.appendChild(this.rootElement);
+
+
+        if (config.width && config.height) {
+            setViewportSize(this.rootElement, config.width, config.height)
         }
-        if (config.height) {
-            this.$root.css("height", String(config.height + getNavbarHeight()));
-        }
 
-        $app_container.append(this.$root);
+        this.layoutController = new LayoutController(this, this.rootElement);
 
-        this.layoutController = new LayoutController(this, this.$root);
+        // Into the host's container, not `rootElement`: a modal's stacking
+        // context is why it lives out there. Recorded on the way in.
+        this.inputDialog = new InputDialog(appContainer, this);
+        this.externalElements.push(this.inputDialog.container);
 
-        // nav bar related objects
-        this.locusGoto = new LocusGoto(this, getNavbarContainer(this));
-        this.resolutionSelector = new ResolutionSelector(this, getNavbarContainer(this));
-        this.resolutionSelector.setResolutionLock(this.resolutionLocked);
-        this.colorscaleWidget = new ColorScaleWidget(this, getNavbarContainer(this));
-        this.controlMapWidget = new ControlMapWidget(this, getNavbarContainer(this));
-        this.normalizationSelector = new NormalizationWidget(this, getNavbarContainer(this));
-        this.inputDialog = new InputDialog($app_container.get(0), this);
+        this.menuElement = this.createMenu(this.rootElement);
+        this.menuElement.style.display = 'none';
 
-        // contact map container related objects
-        const sweepZoom = new SweepZoom(this, this.layoutController.getContactMatrixViewport());
-        const scrollbarWidget = new ScrollbarWidget(this, this.layoutController.getXAxisScrollbarContainer(), this.layoutController.getYAxisScrollbarContainer());
+        // The coordinator is built first: the widgets' observer closures notify it
+        // directly, so it must exist before createWidgets() runs.
+        this.coordinator = new BrowserCoordinator(this);
+        const widgets = createWidgets(this);
+        this.coordinator.adoptWidgets(widgets);
+        this.contactMatrixView = widgets.contactMatrixView;
 
-        const colorScale = new ColorScale(defaultColorScaleConfig);
+        // Initialize interaction handler for user interactions
+        this.interactions = new InteractionHandler(this);
 
-        const ratioColorScale = new RatioColorScale(defaultRatioColorScaleConfig.threshold);
-        ratioColorScale.setColorComponents(defaultRatioColorScaleConfig.negative, '-')
-        ratioColorScale.setColorComponents(defaultRatioColorScaleConfig.positive, '+')
-        const backgroundColor = config.backgroundColor || ContactMatrixView.defaultBackgroundColor
-        this.contactMatrixView = new ContactMatrixView(this, this.layoutController.getContactMatrixViewport(), sweepZoom, scrollbarWidget, colorScale, ratioColorScale, backgroundColor);
+        // Initialize data loader for data loading operations
+        this.dataLoader = new DataLoader(this);
 
-        this.$menu = this.createMenu(this.$root);
-        this.$menu.hide();
-
-        this.chromosomeSelector = new ChromosomeSelectorWidget(this, this.$menu.find('.hic-chromosome-selector-widget-container'));
-
-        const annotation2DWidgetConfig =
-            {
-                title: '2D Annotations',
-                alertMessage: 'No 2D annotations currently loaded for this map'
-            };
-
-        this.annotation2DWidget = new AnnotationWidget(this, this.$menu.find(".hic-annotation-presentation-button-container"), annotation2DWidgetConfig, () => this.tracks2D);
+        // Re-entrancy guard for update(). Rapid callers (mouse drag) coalesce into
+        // a single trailing update rather than queuing one per event.
+        this.updating = false;
+        this.pendingUpdate = undefined;
 
         // prevent user interaction during lengthy data loads
-        this.$user_interaction_shield = $('<div>', {class: 'hic-root-prevent-interaction'});
-        this.$root.append(this.$user_interaction_shield);
-        this.$user_interaction_shield.hide();
+        this.userInteractionShield = document.createElement('div');
+        this.userInteractionShield.className = 'hic-root-prevent-interaction';
+        this.rootElement.appendChild(this.userInteractionShield);
+        this.userInteractionShield.style.display = 'none';
 
         this.hideCrosshairs();
-
-
-        //this.eventBus.subscribe("LocusChange", this);
     }
 
     async init(config) {
 
-        this.state = config.state ? config.state : State.default()
-        this.pending = new Map();
-        this.eventBus.hold();
+        // A restore outlives its browser if the browser is reset or disposed
+        // while it waits -- another restore replacing the session disposes it.
+        // Nothing below writes to a browser that is no longer the one this
+        // started in. A reset rebuilds the contact matrix view, so the one held
+        // here is the test.
+        const {contactMatrixView} = this;
+        const superseded = () => this.isDisposed || this.contactMatrixView !== contactMatrixView;
+
         this.contactMatrixView.disableUpdates = true;
 
         try {
             this.contactMatrixView.startSpinner();
-            this.$user_interaction_shield.show();
+            this.userInteractionShield.style.display = 'block';
 
-            // if (!config.name) config.name = await extractName(config)
-            // const prefix = hasControl ? "A: " : "";
-            // browser.$contactMaplabel.text(prefix + config.name);
-            // browser.$contactMaplabel.attr('title', config.name);
-
-            await this.loadHicFile(config, true);
+            await this.dataLoader.loadHicFile(config, true);
 
             if (config.controlUrl) {
-                await this.loadHicControlFile({
+                await this.dataLoader.loadHicControlFile({
                     url: config.controlUrl,
                     name: config.controlName,
                     nvi: config.controlNvi,
@@ -165,91 +351,153 @@ class HICBrowser {
                 }, true);
             }
 
-            if (config.cycle) {
-                config.displayMode = "A"
-            }
-
+            // No `if (config.cycle) config.displayMode = "A"` here since #536:
+            // writing one config field from another is the normalize stage's,
+            // and this one wrote it onto the host's own object mid-init.
             if (config.displayMode) {
                 this.contactMatrixView.displayMode = config.displayMode;
-                this.eventBus.post({type: "DisplayMode", data: config.displayMode});
-            }
-            if (config.colorScale) {
-                // This must be done after dataset load
-                this.contactMatrixView.setColorScale(config.colorScale);
-                this.eventBus.post({type: "ColorScale", data: this.contactMatrixView.getColorScale()});
-            }
-            if(config.locus) {
-                await this.parseGotoInput(config.locus)
+                this.coordinator.onDisplayMode(config.displayMode);
             }
 
-            var promises = [];
+            // Started, not awaited: a restore resolves once the map is usable,
+            // and its tracks arrive after (#667, ADR-0017 decisions 1 and 7).
+            // A 1D track is a pending track meanwhile, a 2D track draws when it
+            // arrives, and `loadTracks` reports failures itself and never
+            // rejects. A track settling after this browser is gone is dropped
+            // by the loader.
             if (config.tracks) {
-                promises.push(this.loadTracks(config.tracks))
+                this.dataLoader.loadTracks(config.tracks);
             }
 
             if (config.normVectorFiles) {
-                config.normVectorFiles.forEach(function (nv) {
-                    promises.push(this.loadNormalizationFile(nv));
-                })
+                await Promise.all(config.normVectorFiles.map(nv => this.dataLoader.loadNormalizationFile(nv)));
             }
-            await Promise.all(promises);
 
-            const tmp = this.contactMatrixView.colorScaleThresholdCache;
-            this.eventBus.release()
-            this.contactMatrixView.colorScaleThresholdCache = tmp
+            if (superseded()) {
+                return;
+            }
+
+            // The one config field still checked below the seam, and it stays
+            // here on purpose: the set it is checked against is the loaded
+            // dataset's, so the question cannot be asked before the load. It
+            // falls back to `NONE` rather than rejecting -- a saved link naming
+            // a normalization this map does not carry still opens. Recorded in
+            // docs/config-schema.md as a load-stage rule, not part of the resolved schema.
+            //
+            // The rule itself lives in `#resolveNormalization` and
+            // is spelled out once (#561, ADR-0009 decision 5). It used to be
+            // written out a second time here, as its own `Set` and its own
+            // fallback, and this copy ran *after* restore -- so of the two
+            // enforcers the duplicate was the one that won. What stays here is
+            // the question, not the answer: which field is being asked about,
+            // and when.
+            if (config.normalization) {
+                this.state.normalization = await this.#resolveNormalization(config.normalization);
+                await this.#announceSubstitution(config.normalization, this.state.normalization);
+
+                // And the selector catches up, because it cannot have been
+                // right before this line (#603). The mechanism is written down
+                // at `NormalizationWidget.reselect`; what is this call site's
+                // own is where it sits. It cannot move up, for the same reason
+                // the resolution above it cannot: `loadNormalizationFile`
+                // pushes types into `dataset.normalizationTypes`, and the
+                // enforcer reads exactly that set, so asking above the
+                // `Promise.all` would substitute away a normalization one of
+                // those files is about to supply. And it is after
+                // `#announceSubstitution` on purpose -- nothing on this path
+                // calls `clearSubstitution`, so a marker just raised survives
+                // it.
+                await this.coordinator.onNormalizationResolved(this.state.normalization);
+            }
+
+            // Below the normalization write, and pinned there (#575). A host's
+            // `colorScale` carries a threshold it means to be drawn at, and the
+            // only thing that makes that threshold survive the first render is
+            // the cache entry `setColorScale` seeds -- keyed, through
+            // `colorScaleKey`, on `state.normalization`. `#ensureColorScale`
+            // reads that key back on the first pass with the *resolved*
+            // normalization in force, so a seed written any earlier is filed
+            // under a value that is not the one looked up: the lookup misses,
+            // `autoThreshold` runs, and the host's threshold is overwritten by
+            // one computed from the data.
+            //
+            // Above the seam this branch used to sit above, it also wrote
+            // `state.normalization` from `config.normalization` unvalidated --
+            // a second enforcer for the invariant ADR-0009 decision 5 says has
+            // one or none. Moving the branch is what removes it; the write is
+            // not deleted, it is the one below.
+            //
+            // The reordering costs a repaint of the colour-scale widget, which
+            // is all `onColorScale` does (`browserCoordinator.js:281`). It now
+            // lands after the normalization-vector loads rather than
+            // before them -- behind the interaction shield raised at the top of
+            // this method, and read by nothing on either load path.
+            if (config.colorScale) {
+                this.contactMatrixView.setColorScale(config.colorScale);
+                this.coordinator.onColorScale(this.contactMatrixView.getColorScale());
+            }
 
             if (config.cycle) {
-                this.controlMapWidget.toggleDisplayModeCycle();
+                this.coordinator.widgets.controlMapWidget.toggleDisplayModeCycle();
             } else {
-                await this.update()
+                await this.update();
             }
 
         } finally {
-            this.contactMatrixView.stopSpinner();
-            this.$user_interaction_shield.hide();
-            this.contactMatrixView.disableUpdates = false;
-            this.contactMatrixView.update();
+            if (!superseded()) {
+                this.contactMatrixView.stopSpinner();
+                this.userInteractionShield.style.display = 'none';
+                this.contactMatrixView.disableUpdates = false;
+                this.contactMatrixView.update();
+            }
         }
-
     }
 
-    createMenu($root) {
-
-        const html =
-            `<div class="hic-menu" style="display: none;">
+    createMenu(rootElement) {
+        const html = `
+        <div class="hic-menu" style="display: none;">
             <div class="hic-menu-close-button">
                 <i class="fa fa-times"></i>
             </div>
-	        <div class="hic-chromosome-selector-widget-container">
-		        <div>Chromosomes</div>
+            <div class="hic-chromosome-selector-widget-container">
+                <div>Chromosomes</div>
                 <div>
                     <select name="x-axis-selector"></select>
                     <select name="y-axis-selector"></select>
                     <div></div>
                 </div>
-	        </div>
-	        <div class="hic-annotation-presentation-button-container">
-		        <button type="button">2D Annotations</button>
-	        </div>
+            </div>
+            <div class="hic-annotation-presentation-button-container">
+                <button type="button">2D Annotations</button>
+            </div>
         </div>`;
 
-        $root.append($(html));
+        const template = document.createElement('template');
+        template.innerHTML = html.trim();
+        const menuElement = template.content.firstChild;
 
-        const $menu = $root.find(".hic-menu");
+        rootElement.appendChild(menuElement);
 
-        const $fa = $root.find(".fa-times");
-        $fa.on('click', () => this.toggleMenu());
+        const closeButton = menuElement.querySelector(".fa-times");
+        closeButton.addEventListener('click', () => this.toggleMenu());
 
-        return $menu;
-
+        return menuElement;
     }
 
+    /**
+     * Show or hide the track labels, on x and y tracks alike, and the gutters of this
+     * browser's track pairs -- this browser's only, never the page's (ADR-0004).
+     * The setting is per browser and not part of the session.
+     */
     toggleTrackLabelAndGutterState() {
-        this.showTrackLabelAndGutter = !this.showTrackLabelAndGutter;
+        this.showTrackLabelAndGutter = !this.showTrackLabelAndGutter
+        for (const trackPair of this.trackPairs) {
+            trackPair.showLabelAndGutter(this.showTrackLabelAndGutter)
+        }
     }
 
     toggleMenu() {
-        if (this.$menu.is(':visible')) {
+        if (this.menuElement.style.display === "flex") {
             this.hideMenu();
         } else {
             this.showMenu();
@@ -257,45 +505,43 @@ class HICBrowser {
     }
 
     showMenu() {
-        this.$menu.show();
+        this.menuElement.style.display = "flex";
     }
 
     hideMenu() {
-        this.$menu.hide();
-    };
+        this.menuElement.style.display = "none";
+    }
 
     startSpinner() {
-        this.contactMatrixView.startSpinner();
+        this.contactMatrixView.startSpinner()
     }
 
     stopSpinner() {
-        this.contactMatrixView.stopSpinner();
+        this.contactMatrixView.stopSpinner()
     }
 
     async setDisplayMode(mode) {
-        await this.contactMatrixView.setDisplayMode(mode);
-        this.eventBus.post(HICEvent("DisplayMode", mode));
+        await this.contactMatrixView.setDisplayMode(mode)
+        this.coordinator.onDisplayMode(mode)
     }
 
     getDisplayMode() {
-        return this.contactMatrixView ? this.contactMatrixView.displayMode : undefined;
-    }
-
-    toggleDisplayMode() {
-        this.controlMapWidget.toggleDisplayMode();
+        return this.contactMatrixView ? this.contactMatrixView.displayMode : undefined
     }
 
     async getNormalizationOptions() {
 
-        if (!this.dataset) return [];
+        if (!this.dataset) return []
 
-        const baseOptions = await this.dataset.getNormalizationOptions();
+        const baseOptions = this.dataset.getNormalizationOptions ?
+            await this.dataset.getNormalizationOptions() : ['NONE'];
         if (this.controlDataset) {
-            let controlOptions = await this.controlDataset.getNormalizationOptions();
-            controlOptions = new Set(controlOptions);
-            return baseOptions.filter(base => controlOptions.has(base));
+            let controlOptions = this.controlDataset.getNormalizationOptions ?
+                await this.controlDataset.getNormalizationOptions() : ['NONE'];
+            controlOptions = new Set(controlOptions)
+            return baseOptions.filter(base => controlOptions.has(base))
         } else {
-            return baseOptions;
+            return baseOptions
         }
     }
 
@@ -304,17 +550,48 @@ class HICBrowser {
      * @returns {{index: *, binSize: *}[]|Array}
      */
     getResolutions() {
-        if (!this.dataset) return [];
+        if (!this.dataset) return []
 
         const baseResolutions = this.dataset.bpResolutions.map(function (resolution, index) {
             return {index: index, binSize: resolution}
-        });
+        })
+
+        let resolutions = baseResolutions
         if (this.controlDataset) {
-            let controlResolutions = new Set(this.controlDataset.bpResolutions);
-            return baseResolutions.filter(base => controlResolutions.has(base.binSize));
-        } else {
-            return baseResolutions;
+            const controlResolutions = new Set(this.controlDataset.bpResolutions)
+            resolutions = baseResolutions.filter(base => controlResolutions.has(base.binSize))
         }
+
+        // The sentinel rung is appended *after* the intersection rather than
+        // passed through it: a B map declares no whole-genome resolution for the
+        // intersection to keep. It needs none -- genomes must match
+        // (`dataLoader.js:356`), so both datasets compute the same
+        // `wholeGenomeResolution`. ADR-0010.
+        if (this.dataset.isSingleChromosome()) {
+            resolutions = [...resolutions, {index: SENTINEL_ZOOM, binSize: this.dataset.wholeGenomeResolution}]
+        }
+
+        // Sorted by bin size, coarsest first, rather than trusted to arrive that
+        // way. `interactionHandler` reads `resolutions[0]` as the coarsest rung
+        // and the last entry as the finest, and the sentinel's index does not
+        // put it at either end. ADR-0010 decision 1.
+        return resolutions.sort((a, b) => b.binSize - a.binSize)
+    }
+
+    /**
+     * The bin size, in bp, of a zoom rung -- the sentinel rung included.
+     *
+     * The landing pad for #398. Some twenty sites index
+     * `dataset.bpResolutions[state.zoom]` directly, and ADR-0010 decision 2
+     * converts only the ones the sentinel path can reach; the rest are left to
+     * the refactor that owns them, rather than folded into this ticket's diff.
+     *
+     * Delegation, and the split is deliberate: whatever holds a browser reads it
+     * here, and `State` -- which is handed a dataset and, in `getLocus` and
+     * `clampXY`, no browser at all -- reads `dataset.binSizeForZoom` directly.
+     */
+    binSizeForZoom(zoom = this.state.zoom) {
+        return this.dataset.binSizeForZoom(zoom)
     }
 
     isWholeGenome() {
@@ -322,250 +599,598 @@ class HICBrowser {
     }
 
     getColorScale() {
-
-        if (!this.contactMatrixView) return undefined;
-
-        switch (this.getDisplayMode()) {
-            case 'AOB':
-            case 'BOA':
-                return this.contactMatrixView.ratioColorScale;
-            case 'AMB':
-                return this.contactMatrixView.diffColorScale;
-            default:
-                return this.contactMatrixView.colorScale;
-        }
+        return this.contactMatrixView?.getColorScale()
     }
 
     setColorScaleThreshold(threshold) {
-        this.contactMatrixView.setColorScaleThreshold(threshold);
+        this.contactMatrixView.setColorScaleThreshold(threshold)
     }
 
-    updateCrosshairs({x, y, xNormalized, yNormalized}) {
+    /**
+     * Draw the crosshair guides at a viewport pixel. Drawing only: the host is
+     * told by `#publishCrosshairs`, a separate step, so that an echo can be
+     * drawn without the host hearing it (ADR-0020 decision 5).
+     */
+    drawCrosshairs({ x, y }) {
 
-        const xGuide = y < 0 ? {left: 0} : {top: y, left: 0};
-        this.contactMatrixView.$x_guide.css(xGuide);
-        this.layoutController.$x_track_guide.css(xGuide);
+        const xGuide = y < 0 ? { left: '0px' } : { top: `${y}px`, left: '0px' };
+        this.contactMatrixView.xGuideElement.style.left = xGuide.left;
+        if (xGuide.top !== undefined) this.contactMatrixView.xGuideElement.style.top = xGuide.top;
 
-        const yGuide = x < 0 ? {top: 0} : {top: 0, left: x};
-        this.contactMatrixView.$y_guide.css(yGuide);
-        this.layoutController.$y_track_guide.css(yGuide);
+        this.layoutController.xTrackGuideElement.style.left = xGuide.left;
+        if (xGuide.top !== undefined) this.layoutController.xTrackGuideElement.style.top = xGuide.top;
 
-        if (this.customCrosshairsHandler) {
+        const yGuide = x < 0 ? { top: '0px' } : { top: '0px', left: `${x}px` };
+        this.contactMatrixView.yGuideElement.style.top = yGuide.top;
+        if (yGuide.left !== undefined) this.contactMatrixView.yGuideElement.style.left = yGuide.left;
 
-            const {x: stateX, y: stateY, pixelSize} = this.state;
-            const resolution = this.resolution();
+        this.layoutController.yTrackGuideElement.style.top = yGuide.top;
+        if (yGuide.left !== undefined) this.layoutController.yTrackGuideElement.style.left = yGuide.left;
+    }
 
-            const xBP = (stateX + (x / pixelSize)) * resolution;
-            const yBP = (stateY + (y / pixelSize)) * resolution;
-
-            let {startBP: startXBP, endBP: endXBP} = this.genomicState('x');
-            let {startBP: startYBP, endBP: endYBP} = this.genomicState('y');
-
-            this.customCrosshairsHandler({
-                xBP,
-                yBP,
-                startXBP,
-                startYBP,
-                endXBP,
-                endYBP,
-                interpolantX: xNormalized,
-                interpolantY: yNormalized
-            });
+    /**
+     * Tell the host where the source's pointer is: `onCrosshairsMove` on the
+     * coordinator, then the deprecated handler, called beside it and so
+     * exactly when it is (ADR-0020 decisions 5 and 6).
+     *
+     * A host's callback that throws is logged, not propagated: this runs
+     * inside `update()` and the gesture handlers, which have work to finish.
+     *
+     * @param {{chr1, xBP, chr2, yBP, extents}} position - as `onCrosshairsMove` takes it
+     */
+    #notifyHostOfCrosshairsMove(position) {
+        if (!this.#hostHasCrosshairs) {
+            this.#hostHasCrosshairs = true
+            // Deprecated, for removal in 5.0: the first `onCrosshairsMove` is
+            // the show.
+            this.eventBus.post(HICEvent('DidShowCrosshairs', 'DidShowCrosshairs'))
         }
 
+        this.coordinator.onCrosshairsMove(position)
+
+        // The payload Spacewalk has always received, computed as it always
+        // was rather than from the locus: bare bp with no chromosome, not
+        // clamped to the chromosome's end, and the viewport-fraction
+        // interpolants.
+        if (this.customCrosshairsHandler) {
+            const { x, y, xNormalized, yNormalized } = this.#crosshairs.pointer
+            const { x: stateX, y: stateY, pixelSize } = this.state;
+            const resolution = this.resolution();
+            const { startXBP, endXBP, startYBP, endYBP } = position.extents
+
+            try {
+                this.customCrosshairsHandler({
+                    xBP: (stateX + (x / pixelSize)) * resolution,
+                    yBP: (stateY + (y / pixelSize)) * resolution,
+                    startXBP,
+                    startYBP,
+                    endXBP,
+                    endYBP,
+                    interpolantX: xNormalized,
+                    interpolantY: yNormalized
+                });
+            } catch (error) {
+                console.error('Error in custom crosshairs handler:', error);
+            }
+        }
     }
 
+    /**
+     * Tell the host the crosshairs it was told of are gone: `onCrosshairsHide`
+     * on the coordinator, then the deprecated event beside it. A host that was
+     * told of none hears nothing.
+     */
+    #notifyHostOfCrosshairsHide() {
+        if (!this.#hostHasCrosshairs) return
+        this.#hostHasCrosshairs = false
+
+        this.coordinator.onCrosshairsHide()
+        // Deprecated, for removal in 5.0.
+        this.eventBus.post(HICEvent('DidHideCrosshairs', 'DidHideCrosshairs'))
+    }
+
+    /**
+     * The locus under a viewport pixel, as `{chr1, xBP, chr2, yBP}` -- a real
+     * chromosome on each axis, in the whole-genome view too.
+     */
+    crosshairsLocus(pixel) {
+        return locusAtPixel(pixel, this.#crosshairsView())
+    }
+
+    /**
+     * Where a locus falls in this panel's viewport, as `{x, y}` pixels. An
+     * axis this panel is not showing the position on is `null`.
+     */
+    placeCrosshairsLocus(locus) {
+        return placeLocus(locus, this.#crosshairsView())
+    }
+
+    #crosshairsView() {
+        return {
+            state: this.state,
+            dataset: this.dataset,
+            genome: this.genome,
+            viewDimensions: this.contactMatrixView.getViewDimensions(),
+        }
+    }
+
+    /**
+     * @deprecated since 4.x, for removal in 5.0. Register `onCrosshairsMove`
+     * with `browser.coordinator.addCallback` instead: it carries chromosome
+     * names, and the visible extents in place of the interpolants. Until then
+     * the handler is called wherever that callback is (ADR-0020 decision 6).
+     */
     setCustomCrosshairsHandler(crosshairsHandler) {
-        this.customCrosshairsHandler = crosshairsHandler;
+        this.#assertNotDisposed('setCustomCrosshairsHandler')
+        if (!this.#warnedOfCrosshairsHandler) {
+            this.#warnedOfCrosshairsHandler = true
+            console.warn("juicebox: setCustomCrosshairsHandler is deprecated and will be removed in 5.0 -- use coordinator.addCallback('onCrosshairsMove', fn)")
+        }
+        this.customCrosshairsHandler = crosshairsHandler
+    }
+
+    /**
+     * Follow the pointer as the **source** (`CONTEXT.md`, *Crosshairs*): draw
+     * the guides at it, and publish its locus to the sync group and the host.
+     *
+     * The pointer is kept, so that a view change under a still pointer can
+     * re-derive the locus it is now over -- `#refreshCrosshairs`.
+     *
+     * @param {{x: number, y: number}} pointer - viewport pixels
+     */
+    moveCrosshairs(pointer) {
+        this.#crosshairs = {pointer}
+        this.drawCrosshairs(pointer)
+        this.showCrosshairs()
+        this.#publishCrosshairs()
+    }
+
+    /**
+     * Give up the crosshairs: hide them here and, if this panel was their
+     * source, in every panel echoing them -- and tell the host, if it was
+     * told of any.
+     *
+     * Only the source hides the group and tells the host. A key release
+     * reaches every panel on the page, and one outside the source's sync group
+     * must not hide crosshairs that are not its own.
+     */
+    releaseCrosshairs() {
+        const wasSource = this.#isCrosshairsSource()
+        this.#crosshairs = undefined
+        this.hideCrosshairs()
+
+        if (wasSource) {
+            this.#echoToGroup(undefined)
+        }
+        this.#notifyHostOfCrosshairsHide()
+    }
+
+    /**
+     * Show an **echo** (`CONTEXT.md`): the crosshairs of a peer in this
+     * panel's sync group, placed at the same locus in this panel's own pixels.
+     * An axis whose position this panel is not showing gets no guide.
+     * `undefined` hides the echo.
+     *
+     * Drawing only -- no handler call and no event, because the host hears
+     * from the source alone (ADR-0020 decision 5).
+     *
+     * The guard is `syncState`'s, for its reason: `synchedBrowsers` is as
+     * `registry.sync()` last left it, and the host may have opted this panel
+     * out since.
+     *
+     * @param {{chr1: string, xBP: number, chr2: string, yBP: number}|undefined} locus
+     */
+    echoCrosshairs(locus) {
+        if (undefined === locus || !isSynchable(this) || !this.state) {
+            this.#crosshairs = undefined
+            this.hideCrosshairs()
+            return
+        }
+
+        this.#crosshairs = {locus}
+
+        const { x, y } = this.placeCrosshairsLocus(locus)
+        this.drawCrosshairs({ x: x ?? 0, y: y ?? 0 })
+        this.#displayGuides({ horizontal: null !== y, vertical: null !== x })
+    }
+
+    /** Whether the pointer these crosshairs follow is over this panel. */
+    #isCrosshairsSource() {
+        return undefined !== this.#crosshairs?.pointer
+    }
+
+    /**
+     * Re-place the crosshairs after this panel's view has changed. `update()`
+     * calls it once the new view is painted.
+     *
+     * The source's pointer has not moved, but the locus under it has: derive
+     * it again and publish it. An echo's locus has not moved, but its pixel
+     * has: place it again. A panel showing no crosshairs does nothing.
+     */
+    #refreshCrosshairs() {
+        if (!this.dataset || !this.state) return
+
+        if (this.#isCrosshairsSource()) {
+            this.#publishCrosshairs({ onlyIfChanged: true })
+        } else if (this.#crosshairs?.locus) {
+            this.echoCrosshairs(this.#crosshairs.locus)
+        }
+    }
+
+    /**
+     * Tell the sync group and the host the locus under the source's pointer.
+     * The one place a crosshairs position leaves its source, whether a pointer
+     * move or a view change put it there.
+     */
+    #publishCrosshairs({ onlyIfChanged = false } = {}) {
+        const locus = this.crosshairsLocus(this.#crosshairs.pointer)
+
+        // The host is told only while this panel shows a chromosome pair. In
+        // the whole-genome view the visible extents run along the genome and
+        // the locus along a chromosome, and a host cannot place one in the
+        // other -- so the guides and the echo carry on, and the host hears
+        // the crosshairs hide (ADR-0020 decision 5).
+        const wholeGenome = this.dataset.isWholeGenome(this.state.chr1)
+        const position = wholeGenome ? locus : { ...locus, extents: this.#visibleExtents() }
+
+        // A repaint that left the view where it was has nothing new to say.
+        const published = JSON.stringify(position)
+        if (onlyIfChanged && published === this.#crosshairs.published) return
+        this.#crosshairs.published = published
+
+        this.#echoToGroup(locus)
+        if (wholeGenome) {
+            this.#notifyHostOfCrosshairsHide()
+        } else {
+            this.#notifyHostOfCrosshairsMove(position)
+        }
+    }
+
+    /** The bp this panel is showing on each axis, as `onCrosshairsMove` carries it. */
+    #visibleExtents() {
+        const { startBP: startXBP, endBP: endXBP } = this.genomicState('x');
+        const { startBP: startYBP, endBP: endYBP } = this.genomicState('y');
+        return { startXBP, endXBP, startYBP, endYBP }
+    }
+
+    #echoToGroup(locus) {
+        for (const browser of [...this.synchedBrowsers]) {
+            browser.echoCrosshairs(locus)
+        }
     }
 
     hideCrosshairs() {
-
-        this.contactMatrixView.$x_guide.hide();
-        this.layoutController.$x_track_guide.hide();
-
-        this.contactMatrixView.$y_guide.hide();
-        this.layoutController.$y_track_guide.hide();
-
+        this.#displayGuides({ horizontal: false, vertical: false })
     }
 
     showCrosshairs() {
+        this.#displayGuides({ horizontal: true, vertical: true })
+    }
 
-        this.contactMatrixView.$x_guide.show();
-        this.layoutController.$x_track_guide.show();
+    /**
+     * The x guides are the horizontal line, positioned by `top`, and the y
+     * guides the vertical one -- each named for the axis it runs along.
+     */
+    #displayGuides({ horizontal, vertical }) {
+        const xDisplay = horizontal ? 'block' : 'none'
+        this.contactMatrixView.xGuideElement.style.display = xDisplay;
+        this.layoutController.xTrackGuideElement.style.display = xDisplay;
 
-        this.contactMatrixView.$y_guide.show();
-        this.layoutController.$y_track_guide.show();
+        const yDisplay = vertical ? 'block' : 'none'
+        this.contactMatrixView.yGuideElement.style.display = yDisplay;
+        this.layoutController.yTrackGuideElement.style.display = yDisplay;
     }
 
     genomicState(axis) {
 
         let width = this.contactMatrixView.getViewDimensions().width
-        let resolution = this.dataset.bpResolutions[this.state.zoom];
+        let resolution = this.binSizeForZoom(this.state.zoom)
         const bpp =
             (this.dataset.chromosomes[this.state.chr1].name.toLowerCase() === "all") ?
                 this.genome.getGenomeLength() / width :
                 resolution / this.state.pixelSize
 
-        const gs = {
-            bpp: bpp
-        };
+        const gs =
+            {
+                bpp
+            }
 
         if (axis === "x") {
-            gs.chromosome = this.dataset.chromosomes[this.state.chr1];
-            gs.startBP = this.state.x * resolution;
-            gs.endBP = gs.startBP + bpp * width;
+            gs.chromosome = this.dataset.chromosomes[this.state.chr1]
+            gs.startBP = this.state.x * resolution
+            gs.endBP = gs.startBP + bpp * width
         } else {
-            gs.chromosome = this.dataset.chromosomes[this.state.chr2];
-            gs.startBP = this.state.y * resolution;
-            gs.endBP = gs.startBP + bpp * this.contactMatrixView.getViewDimensions().height;
+            gs.chromosome = this.dataset.chromosomes[this.state.chr2]
+            gs.startBP = this.state.y * resolution
+            gs.endBP = gs.startBP + bpp * this.contactMatrixView.getViewDimensions().height
         }
-        return gs;
+        return gs
     }
-
 
     /**
      * Load a list of 1D genome tracks (wig, etc).
      *
      * NOTE: public API function
      *
+     * A track's own entry, and so the one place a track config that was never
+     * part of a session is resolved: `normalizeTrackConfigs` is the same stage a
+     * session's tracks meet, so a shortcut URL expands and the document defaults
+     * apply whichever direction a track arrives from (#536). Tracks that *were*
+     * part of a session reach `DataLoader.loadTracks` from `init()` below,
+     * already resolved and not through here.
+     *
      * @param configs
      */
     async loadTracks(configs) {
-
-        // If loading a single track remember its name, for error message
-        const errorPrefix = 1 === configs.length ? ("Error loading track " + configs[0].name) : "Error loading tracks";
-
-        try {
-            this.contactMatrixView.startSpinner();
-
-            const tracks = [];
-            const promises2D = [];
-
-            for (let config of /*trackConfigurations*/configs) {
-
-                const fileName = isFile(config.url) ? config.url.name : await FileUtils.getFilenameExtended(config.url);
-
-                if(!config.format) {
-                    config.format = TrackUtils.inferFileFormat(fileName)
-                }
-
-                if ("annotation" === config.type && config.color === DEFAULT_ANNOTATION_COLOR) {
-                    delete config.color;
-                }
-
-                if (config.max === undefined) {
-                    config.autoscale = true;
-                }
-
-                // config.height = ("annotation" === config.type) ? annotationTrackHeight : wigTrackHeight;
-                config.height = trackHeight;
-
-                if (undefined === config.format || "bedpe" === config.format || "interact" === config.format) {
-                    // Assume this is a 2D track
-                    promises2D.push(Track2D.loadTrack2D(config, this.genome));
-                } else {
-                    const track = await igv.createTrack(config, this);
-                    tracks.push(track)
-                }
-            }
-
-            if (tracks.length > 0) {
-
-                this.layoutController.tracksLoaded(tracks);
-
-                const $gear_container = $('.hic-igv-right-hand-gutter');
-                if (true === this.showTrackLabelAndGutter) {
-                    $gear_container.show();
-                } else {
-                    $gear_container.hide();
-                }
-
-                await this.updateLayout();
-            }
-
-            if (promises2D.length > 0) {
-
-                const tracks2D = await Promise.all(promises2D)
-                if (tracks2D && tracks2D.length > 0) {
-                    this.tracks2D = this.tracks2D.concat(tracks2D);
-                    this.eventBus.post(HICEvent("TrackLoad2D", this.tracks2D));
-                }
-
-            }
-
-        } catch (error) {
-            presentError(errorPrefix, error);
-            console.error(error)
-
-        } finally {
-            this.contactMatrixView.stopSpinner();
-        }
-    }
-
-    async loadNormalizationFile(url) {
-
-        if (!this.dataset) return;
-        this.eventBus.post(HICEvent("NormalizationFileLoad", "start"));
-
-        const normVectors = await this.dataset.hicFile.readNormalizationVectorFile(url, this.dataset.chromosomes)
-        for (let type of normVectors['types']) {
-            if (!this.dataset.normalizationTypes) {
-                this.dataset.normalizationTypes = [];
-            }
-            if (!this.dataset.normalizationTypes.includes(type)) {
-                this.dataset.normalizationTypes.push(type);
-            }
-            this.eventBus.post(HICEvent("NormVectorIndexLoad", this.dataset));
-        }
-
-        return normVectors;
+        this.#assertNotDisposed('loadTracks');
+        return this.dataLoader.loadTracks(normalizeTrackConfigs(configs));
     }
 
     /**
-     * Render the XY pair of tracks.
+     * `loadTracks`, but it rejects instead of alerting.
      *
-     * @param xy
+     * Internal, and the one the target-set fan-out calls: a fan-out reports
+     * once per gesture, on the host's own notification surface, so it needs to
+     * be able to tell a target's failure from its success -- which the public
+     * method cannot say, because it catches, alerts and resolves. Same
+     * normalization, same loader body; only the reporting differs. #615.
      */
-    async renderTrackXY(xy) {
+    async loadTracksOrThrow(configs) {
+        this.#assertNotDisposed('loadTracksOrThrow');
+        return this.dataLoader.loadTracksOrThrow(normalizeTrackConfigs(configs));
+    }
 
-        try {
-            this.startSpinner()
-            await xy.updateViews();
-        } finally {
-            this.stopSpinner()
+    async loadNormalizationFile(url) {
+        return this.dataLoader.loadNormalizationFile(url);
+    }
+
+    /**
+     * Set the primary dataset. The dataset only: a state reaches the browser
+     * through `setState`, the chokepoint, and never alongside the dataset
+     * (#559, ADR-0009 decision 1).
+     *
+     * @param {Dataset} dataset - The dataset to activate
+     */
+    setActiveDataset(dataset) {
+        this.dataset = dataset;
+    }
+
+    /**
+     * The primary dataset -- the "A" map, as opposed to `controlDataset` -- and
+     * the view in force.
+     *
+     * `dataset`/`state` is the vocabulary internal code reads; `activeDataset`
+     * and `activeState` below are aliases for it. See #468.
+     *
+     * Both dataset names are load-bearing outside this repo: juicebox-web reads
+     * `dataset` (3 sites) and so does Spacewalk (`juicebox/hicMapState.js`),
+     * while Spacewalk reads `activeDataset` from `juicebox/juiceboxPanel.js`.
+     * Neither name can simply win.
+     *
+     * `dataset` and `controlDataset` are plain fields, assigned in the
+     * constructor (#563). Only `state` keeps an accessor, and only a getter:
+     * the state has one writer, `setState`.
+     */
+    get state() {
+        return this.#state;
+    }
+
+    /** Alias for `dataset`. Retained for host apps -- Spacewalk reads it (juicebox/juiceboxPanel.js, 4 sites). */
+    get activeDataset() {
+        return this.dataset;
+    }
+
+    /** Alias for `dataset`. Retained for host apps -- Spacewalk reads it (juicebox/juiceboxPanel.js, 4 sites). */
+    set activeDataset(value) {
+        this.dataset = value;
+    }
+
+    /**
+     * Alias for `state`. Kept as published surface alongside `activeDataset`:
+     * no host we can measure reads it, and this repo cannot see the ones it
+     * cannot measure -- ADR-0003's "no measurable consumer is not no consumer",
+     * which is why the getters survived #563 and only the setters went.
+     */
+    get activeState() {
+        return this.state;
+    }
+
+    /**
+     * Tear this browser down: the counterpart of the constructor.
+     *
+     * NOTE: public API function
+     *
+     * The single teardown path -- `registry.delete()` and `registry.deleteAll()`
+     * both come here, which is what makes the four verbs of ADR-0005's context
+     * table agree. It removes what the constructor installed, in both places it
+     * installed it, gives up the browser's peers and its registry slot, and
+     * clears the bus the browser owns.
+     *
+     * It deliberately does *not* touch `EventBus.globalBus`: those
+     * registrations belong to the host and outlive every browser on the page.
+     *
+     * Idempotent, and the only method still callable afterwards -- a host that
+     * tears down twice is doing the right thing twice.
+     */
+    dispose() {
+
+        if (this.#disposed) {
+            return;
+        }
+
+        this.#disposed = true;
+
+        // As in `clearDataset`: a source takes its echoes with it.
+        this.releaseCrosshairs();
+        this.unsyncSelf();
+
+        // The outbound half of the same edge, and only on this path: membership
+        // is a pair of references, and a host keeps its browser across call
+        // sites (juicebox-web holds one from `getCurrentBrowser()`), so a zombie
+        // still holding its old peers pins every live browser's object graph.
+        // `clearDataset()` deliberately does not do this -- that browser is
+        // still on the page and gets re-paired by `registry.sync()`. #492.
+        this.synchedBrowsers = new Set();
+
+        for (const element of this.externalElements) {
+            element.remove();
+        }
+        this.externalElements = [];
+
+        // The other thing installed outside `rootElement`: the contact matrix
+        // view's document-level gesture handlers, which removing an element
+        // cannot take with it. #494.
+        this.contactMatrixView.dispose();
+
+        this.rootElement.remove();
+
+        // The per-browser bus dies with the browser, so clearing it is what
+        // releases the host handlers still attached to it -- Spacewalk's
+        // DidHideCrosshairs subscription is a live retention path today.
+        this.eventBus.clear();
+
+        this.registry.releaseSlot(this);
+    }
+
+    /**
+     * Whether `dispose()` has run and no `reset()` has brought the browser back.
+     * Internal: a load that outlives its browser reads it to stand down (#665).
+     */
+    get isDisposed() {
+        return this.#disposed;
+    }
+
+    /**
+     * Refuse a published call on a disposed browser. Decision 6 of ADR-0005.
+     */
+    #assertNotDisposed(methodName) {
+        if (this.#disposed) {
+            throw new DisposedBrowserError(this.id, methodName);
         }
     }
 
+    /**
+     * Put this browser back to how it was constructed, without becoming a
+     * different browser.
+     *
+     * NOTE: public API function
+     *
+     * Dispose-then-construct on the same instance, per decision 1 of ADR-0005.
+     * The object, its `id` and its registry slot survive, because juicebox-web
+     * does
+     *
+     *     const browser = hic.getCurrentBrowser()
+     *     browser.reset();
+     *     await browser.loadHicFile(config);
+     *     controlMapDropdown.enableIfMapLoaded(browser)
+     *
+     * -- one reference held across three lines and then handed onward. That is
+     * what makes this non-breaking; returning a new browser would not be.
+     *
+     * `dispose()` is the teardown half, so this cannot drift from the delete
+     * paths. What is restored afterwards is the three things `dispose()` gives
+     * up that a *reset* browser has not actually lost: its place among its
+     * siblings, its registry slot, and being the current browser.
+     *
+     * The sync group is not restored: `reset()` has always unsynced, and the
+     * registry re-pairs on the next `sync()`. The **target set** is restored,
+     * and the two diverge on purpose -- see `wasTargeted` below and
+     * `docs/adr/0015`.
+     */
     reset() {
-        this.layoutController.removeAllTrackXYPairs();
-        this.contactMatrixView.clearImageCaches();
-        this.tracks2D = [];
-        this.tracks = [];
-        this.$contactMaplabel.text("");
-        this.$contactMaplabel.attr('title', "");
-        this.$controlMaplabel.text("");
-        this.$controlMaplabel.attr('title', "");
-        this.dataset = undefined;
-        this.controlDataset = undefined;
-        this.unsyncSelf();
+
+        this.#assertNotDisposed('reset')
+
+        const {config, id, registry} = this
+        const appContainer = this.rootElement.parentElement
+        const slot = registry.browsers.indexOf(this)
+        const wasCurrent = registry.currentBrowser === this
+
+        // Captured before the teardown, because `dispose()` drops this browser
+        // from the target set on its way out -- and unlike the sync group, the
+        // target set survives a reset. Sync membership is a rule that gets
+        // recomputed; targeting is a user's act, and a reset should not
+        // silently undo it. #615.
+        const wasTargeted = registry.isTargetedExplicitly(this)
+
+        // The node to re-insert before, and it has to be one that survives the
+        // teardown: `rootElement`'s immediate sibling is this browser's own
+        // dialog, which `dispose()` removes. Skipping this browser's external
+        // elements lands on the next browser's root, or on nothing.
+        // Only `rootElement` is placed: the dialog beside it is a modal, and
+        // where it sits among its siblings is not something anyone can see.
+        const mine = new Set(this.externalElements)
+        let anchor = this.rootElement.nextSibling
+        while (anchor && mine.has(anchor)) {
+            anchor = anchor.nextSibling
+        }
+
+        // Deselected first, and for the same reason `deleteAll` does it:
+        // `releaseSlot` falls the selection through to a survivor, so disposing
+        // the current browser posts a `BrowserSelect` naming a sibling -- and
+        // juicebox-web subscribes to that event. A reset does not change which
+        // browser is selected, so it should post nothing at all.
+        if (wasCurrent) {
+            registry.select(undefined)
+        }
+
+        this.dispose()
+
+        // The one place this flag is cleared. A reset browser is alive again,
+        // and the guard on every published method has to see that.
+        this.#disposed = false
+
+        this.#construct(appContainer, config, id)
+
+        // Reconstruction appends, so the panels of a two-panel embed would
+        // visibly swap without this. Decision 3.
+        appContainer.insertBefore(this.rootElement, anchor)
+
+        // Not registered before the reset -- during `init()`, or in a test --
+        // so there is no slot to take back and nothing to select.
+        if (-1 !== slot) {
+            registry.reclaimSlot(this, slot, wasCurrent, wasTargeted)
+        }
     }
 
-    clearSession() {
-        // Clear current datasets.
+    /**
+     * The soft clear a dataset load runs on its way in: the browser and its DOM
+     * stay, only the data goes. Internal only -- not on the public API manifest.
+     */
+    clearDataset() {
+        // Clear current datasets. The state goes with them: a browser with no
+        // dataset has no view, and `setState` is the only way one comes back.
         this.dataset = undefined;
+        this.#state = undefined;
         this.controlDataset = undefined;
-        this.setDisplayMode('A');
-        this.unsyncSelf();
+        this.setDisplayMode('A')
+        // Before the group is left, while its echoes can still be reached.
+        this.releaseCrosshairs()
+        this.unsyncSelf()
+    }
+
+    /**
+     * Clear everything that belongs to the genome: track pairs, pending tracks
+     * and 2D annotations. A track has no genome of its own -- the panel's is its
+     * genome declaration -- so once the panel's genome changes its tracks are
+     * wrong data, not the user's work.
+     *
+     * Internal only -- not on the public API manifest. Called from the
+     * genome-change branch of both map-load paths, before the change is
+     * announced, so a host hearing of it sees an empty panel. Draws nothing:
+     * the load it is part of does. #682, ADR-0019.
+     */
+    clearTracks() {
+        this.layoutController.removeAllTrackXYPairs()
+        this.tracks2D = []
     }
 
     /**
      * Remove reference to self from all synchedBrowsers lists.
      */
     unsyncSelf() {
-        const allBrowsers = getAllBrowsers();
-        for (let b of allBrowsers) {
-            b.unsync(this);
+        for (let b of this.registry.browsers) {
+            b.unsync(this)
         }
     }
 
@@ -574,8 +1199,14 @@ class HICBrowser {
      * @param browser
      */
     unsync(browser) {
-        this.synchedBrowsers = this.synchedBrowsers.filter(b => b != browser);
+        const list = [...this.synchedBrowsers]
+        this.synchedBrowsers = new Set(list.filter(b => b !== browser))
     }
+
+    /**
+     * Data loading methods delegate to DataLoader.
+     * These methods are kept for backward compatibility and to maintain the public API.
+     */
 
     /**
      * Load a .hic file
@@ -587,103 +1218,35 @@ class HICBrowser {
      * @param noUpdates
      */
     async loadHicFile(config, noUpdates) {
+        this.#assertNotDisposed('loadHicFile');
+        return this.dataLoader.loadHicFile(config, noUpdates);
+    }
 
-        if (!config.url) {
-            console.log("No .hic url specified");
-            return undefined;
-        }
+    /**
+     * `loadHicFile`, but a bot challenge is rethrown without an alert.
+     *
+     * Internal, and the one the target-set fan-out calls (#680): a fan-out reports
+     * once per gesture, on the host's own notification surface, and four panels
+     * aimed at one WAF-gated URL must not raise four identical modals. Same
+     * loader body; only the reporting differs. #679.
+     */
+    async loadHicFileOrThrow(config, noUpdates) {
+        this.#assertNotDisposed('loadHicFileOrThrow');
+        return this.dataLoader.loadHicFileOrThrow(config, noUpdates);
+    }
 
-        this.clearSession();
-
-        try {
-
-            this.contactMatrixView.startSpinner();
-            if (!noUpdates) {
-                this.$user_interaction_shield.show();
-            }
-
-            const name = extractName(config)
-            const prefix = this.controlDataset ? "A: " : "";
-            this.$contactMaplabel.text(prefix + name);
-            this.$contactMaplabel.attr('title', name);
-            config.name = name;
-
-            this.dataset = await Dataset.loadDataset(config)
-            this.dataset.name = name
-
-            const previousGenomeId = this.genome ? this.genome.id : undefined;
-            this.genome = new Genome(this.dataset.genomeId, this.dataset.chromosomes);
-
-            // TODO -- this is not going to work with browsers on different assemblies on the same page.
-            //igv.browser.genome = this.genome;
-
-            if (this.genome.id !== previousGenomeId) {
-                EventBus.globalBus.post(HICEvent("GenomeChange", this.genome.id));
-            }
-            this.eventBus.post(HICEvent("MapLoad", this.dataset));
-
-            if (config.state) {
-                if (!config.state.hasOwnProperty("chr1")) {
-                    config.state = State.parse(config.state);
-                }
-                await this.setState(config.state);
-            } else if (config.synchState && this.canBeSynched(config.synchState)) {
-                this.syncState(config.synchState);
-            } else {
-                await this.setState(State.default(this.config));
-            }
-
-
-            // Initiate loading of the norm vector index, but don't block if the "nvi" parameter is not available.
-            // Let it load in the background
-            const eventBus = this.eventBus
-
-            // If nvi is not supplied, try reading it from remote lambda service
-            if (!config.nvi && typeof config.url === "string") {
-                const url = new URL(config.url)
-                const key = encodeURIComponent(url.hostname + url.pathname)
-                const nviResponse = await fetch('https://t5dvc6kn3f.execute-api.us-east-1.amazonaws.com/dev/nvi/' + key)
-                if (nviResponse.status === 200) {
-                    const nvi = await nviResponse.text()
-                    if (nvi) {
-                        config.nvi = nvi
-                    }
-                }
-            }
-
-            if (config.nvi) {
-                await this.dataset.getNormVectorIndex(config)
-                eventBus.post(HICEvent("NormVectorIndexLoad", this.dataset));
-            } else {
-                const dataset = this.dataset
-                dataset.getNormVectorIndex(config)
-                    .then(function (normVectorIndex) {
-                        if (!config.isControl) {
-                            eventBus.post(HICEvent("NormVectorIndexLoad", dataset));
-                        }
-                    })
-            }
-
-            syncBrowsers();
-
-            // Find a browser to sync with, if any
-            const compatibleBrowsers = getAllBrowsers().filter(b => b != this &&
-                b.dataset && b.dataset.isCompatible(this.dataset));
-            if (compatibleBrowsers.length > 0) {
-                this.syncState(compatibleBrowsers[0].getSyncState());
-            }
-
-        } catch (error) {
-            this.$contactMaplabel.text('');
-            this.$contactMaplabel.attr('');
-            config.name = name;
-            throw error;
-        } finally {
-            this.stopSpinner();
-            if (!noUpdates) {
-                this.$user_interaction_shield.hide();
-            }
-        }
+    /**
+     * Load a live contact map via hic-straw LiveContactMap.
+     *
+     * NOTE: public API function
+     *
+     * @param {Object} config - Configuration with liveContactMap, name, locus, state
+     * @param {boolean} noUpdates - If true, don't trigger UI updates
+     * @returns {Promise<HiCDataset>}
+     */
+    async loadLiveContactMap(config, noUpdates) {
+        this.#assertNotDisposed('loadLiveContactMap');
+        return this.dataLoader.loadLiveContactMap(config, noUpdates);
     }
 
     /**
@@ -695,79 +1258,65 @@ class HICBrowser {
      * @param config
      */
     async loadHicControlFile(config, noUpdates) {
-
-        try {
-            this.$user_interaction_shield.show()
-            this.contactMatrixView.startSpinner()
-            this.controlUrl = config.url
-            const name = extractName(config)
-            config.name = name
-
-            const controlDataset = await Dataset.loadDataset(config)
-            controlDataset.name = name
-
-            if (!this.dataset || this.dataset.isCompatible(controlDataset)) {
-                this.controlDataset = controlDataset;
-                if (this.dataset) {
-                    this.$contactMaplabel.text("A: " + this.dataset.name);
-                }
-                this.$controlMaplabel.text("B: " + controlDataset.name);
-                this.$controlMaplabel.attr('title', controlDataset.name);
-
-                //For the control dataset, block until the norm vector index is loaded
-                await controlDataset.getNormVectorIndex(config)
-                this.eventBus.post(HICEvent("ControlMapLoad", this.controlDataset));
-
-                if (!noUpdates) {
-                    this.update();
-                }
-            } else {
-                Alert.presentAlert('"B" map genome (' + controlDataset.genomeId + ') does not match "A" map genome (' + this.genome.id + ')');
-            }
-        } finally {
-            this.$user_interaction_shield.hide();
-            this.stopSpinner();
-        }
+        this.#assertNotDisposed('loadHicControlFile');
+        return this.dataLoader.loadHicControlFile(config, noUpdates);
     }
 
-    async parseGotoInput(string) {
+    /**
+     * `loadHicControlFile`, but it rejects instead of alerting.
+     *
+     * Internal, and the one the target-set fan-out calls (#681). The public method
+     * alerts an incompatible control map and resolves `undefined`, so a caller
+     * cannot tell a refusal from a success; this one throws an `Error` whose
+     * `code` is `'control-incompatible'`, and rethrows a bot challenge
+     * unreported. #679.
+     */
+    async loadHicControlFileOrThrow(config, noUpdates) {
+        this.#assertNotDisposed('loadHicControlFileOrThrow');
+        return this.dataLoader.loadHicControlFileOrThrow(config, noUpdates);
+    }
 
-        let xLocus;
-        let yLocus;
-        const loci = string.split(' ');
-        if (loci.length === 1) {
-            xLocus = this.parseLocusString(loci[0]);
-            yLocus = xLocus;
-        } else {
-            xLocus = this.parseLocusString(loci[0]);
-            yLocus = this.parseLocusString(loci[1]);
-            if (yLocus === undefined) yLocus = xLocus;
+    async parseGotoInput(input) {
+        this.#assertNotDisposed('parseGotoInput');
+        return this.interactions.parseGotoInput(input);
+    }
+
+    parseLocusString(locus) {
+        return this.interactions.parseLocusString(locus);
+    }
+
+    async lookupFeatureOrGene(name) {
+
+        const trimmedName = name.trim();
+        const upperName = trimmedName.toUpperCase();
+
+        if (this.genome.featureDB.has(upperName)) {
+            this.registry.selectedGene = trimmedName
+            this.state.selectedGene = trimmedName
+            const {chr, start, end } = this.genome.featureDB.get(upperName)
+
+            // Internally, loci are 0-based. parseLocusString() assumes and user-provided locus which is 1-based
+            return this.parseLocusString(`${chr}:${start + 1}-${end}`)
         }
 
-        if (xLocus === undefined) {
-            // Try a gene name search.
-            const result = await geneSearch(this.genome.id, loci[0].trim())
-
-            if (result) {
-                Globals.selectedGene = loci[0].trim();
-                xLocus = this.parseLocusString(result);
-                yLocus = xLocus;
-                this.state.selectedGene = Globals.selectedGene;
-                this.goto(xLocus.chr, xLocus.start, xLocus.end, yLocus.chr, yLocus.start, yLocus.end, 5000);
-            } else {
-                alert('No feature found with name "' + loci[0] + '"');
-            }
-
-        } else {
-
-            if (xLocus.wholeChr && yLocus.wholeChr) {
-                await this.setChromosomes(xLocus.chr, yLocus.chr);
-            } else {
-                this.goto(xLocus.chr, xLocus.start, xLocus.end, yLocus.chr, yLocus.start, yLocus.end);
-            }
+        const geneResult = await geneSearch(this.genome.id, trimmedName);
+        if (geneResult) {
+            this.registry.selectedGene = trimmedName;
+            this.state.selectedGene = trimmedName;
+            return this.parseLocusString(geneResult)
         }
 
-    };
+        return undefined;  // No match found
+    }
+
+    /**
+     * Interaction methods delegate to InteractionHandler.
+     * These methods are kept for backward compatibility and to maintain the public API.
+     */
+
+    async goto(chr1, bpX, bpXMax, chr2, bpY, bpYMax) {
+        return this.interactions.goto(chr1, bpX, bpXMax, chr2, bpY, bpYMax);
+    }
 
     /**
      * Find the closest matching zoom index (index into the dataset resolutions array) for the target resolution.
@@ -780,46 +1329,8 @@ class HICBrowser {
      * @returns {number}
      */
     findMatchingZoomIndex(targetResolution, resolutionArray) {
-        const isObject = resolutionArray.length > 0 && resolutionArray[0].index !== undefined;
-        for (let z = resolutionArray.length - 1; z > 0; z--) {
-            const binSize = isObject ? resolutionArray[z].binSize : resolutionArray[z];
-            const index = isObject ? resolutionArray[z].index : z;
-            if (binSize >= targetResolution) {
-                return index;
-            }
-        }
-        return 0;
-    };
-
-    parseLocusString(locus) {
-
-        const locusObject = {};
-        const parts = locus.trim().split(':');
-        const chromosome = this.genome.getChromosome(parts[0].toLowerCase());
-
-        if (!chromosome) {
-            return undefined;
-        } else {
-            locusObject.chr = chromosome.index;
-        }
-
-        if (parts.length === 1) {
-            // Chromosome name only
-            locusObject.start = 0;
-            locusObject.end = this.dataset.chromosomes[locusObject.chr].size;
-            locusObject.wholeChr = true;
-        } else {
-            const extent = parts[1].split("-");
-            let numeric = extent[0].replace(/\,/g, '');
-            locusObject.start = isNaN(numeric) ? undefined : parseInt(numeric, 10) - 1;
-            if (extent.length == 2) {
-                numeric = extent[1].replace(/\,/g, '');
-                locusObject.end = isNaN(numeric) ? undefined : parseInt(numeric, 10);
-            }
-        }
-        return locusObject;
-    };
-
+        return this.interactions.findMatchingZoomIndex(targetResolution, resolutionArray);
+    }
 
     /**
      * @param scaleFactor Values range from greater then 1 to decimal values less then one
@@ -829,95 +1340,8 @@ class HICBrowser {
      * @param anchorPy
      */
     async pinchZoom(anchorPx, anchorPy, scaleFactor) {
-
-        if (this.state.chr1 === 0) {
-            await this.zoomAndCenter(1, anchorPx, anchorPy);
-        } else {
-            try {
-                this.startSpinner()
-
-                const bpResolutions = this.getResolutions();
-                const currentResolution = bpResolutions[this.state.zoom];
-
-                let newBinSize
-                let newZoom
-                let newPixelSize
-                let zoomChanged
-
-                if (this.resolutionLocked ||
-                    (this.state.zoom === bpResolutions.length - 1 && scaleFactor > 1) ||
-                    (this.state.zoom === 0 && scaleFactor < 1)) {
-                    // Can't change resolution level, must adjust pixel size
-                    newBinSize = currentResolution.binSize;
-                    newPixelSize = Math.min(MAX_PIXEL_SIZE, this.state.pixelSize * scaleFactor);
-                    newZoom = this.state.zoom;
-                    zoomChanged = false;
-                } else {
-                    const targetBinSize = (currentResolution.binSize / this.state.pixelSize) / scaleFactor;
-                    newZoom = this.findMatchingZoomIndex(targetBinSize, bpResolutions);
-                    newBinSize = bpResolutions[newZoom].binSize;
-                    zoomChanged = newZoom !== this.state.zoom;
-                    newPixelSize = Math.min(MAX_PIXEL_SIZE, newBinSize / targetBinSize);
-                }
-                const z = await this.minZoom(this.state.chr1, this.state.chr2)
-
-
-                if (!this.resolutionLocked && scaleFactor < 1 && newZoom < z) {
-                    // Zoom out to whole genome
-                    this.setChromosomes(0, 0);
-                } else {
-
-                    const minPS = await this.minPixelSize(this.state.chr1, this.state.chr2, newZoom)
-
-                    const state = this.state;
-
-                    newPixelSize = Math.max(newPixelSize, minPS);
-
-                    // Genomic anchor  -- this position should remain at anchorPx, anchorPy after state change
-                    const gx = (state.x + anchorPx / state.pixelSize) * currentResolution.binSize;
-                    const gy = (state.y + anchorPy / state.pixelSize) * currentResolution.binSize;
-
-                    state.x = gx / newBinSize - anchorPx / newPixelSize;
-                    state.y = gy / newBinSize - anchorPy / newPixelSize;
-
-                    state.zoom = newZoom;
-                    state.pixelSize = newPixelSize;
-
-                    this.clamp();
-
-                    this.contactMatrixView.zoomIn(anchorPx, anchorPy, 1 / scaleFactor)
-
-                    let event = HICEvent("LocusChange", {
-                        state: state,
-                        resolutionChanged: zoomChanged,
-                        chrChanged: false
-                    })
-
-                    this.update(event);
-                    //this.eventBus.post(event);
-                }
-            } finally {
-                this.stopSpinner()
-            }
-        }
-
+        return this.interactions.pinchZoom(anchorPx, anchorPy, scaleFactor);
     }
-
-    // TODO -- apparently not used.  Where is this handled?
-    // async wheelClickZoom(direction, centerPX, centerPY) {
-    //     if (this.resolutionLocked || this.state.chr1 === 0) {   // Resolution locked OR whole genome view
-    //         this.zoomAndCenter(direction, centerPX, centerPY);
-    //     } else {
-    //         const z = await minZoom.call(this, this.state.chr1, this.state.chr2)
-    //         var newZoom = this.state.zoom + direction;
-    //         if (direction < 0 && newZoom < z) {
-    //             this.setChromosomes(0, 0);
-    //         } else {
-    //             this.zoomAndCenter(direction, centerPX, centerPY);
-    //         }
-    //
-    //     }
-    // }
 
     // Zoom in response to a double-click
     /**
@@ -928,60 +1352,7 @@ class HICBrowser {
      * @returns {Promise<void>}
      */
     async zoomAndCenter(direction, centerPX, centerPY) {
-
-        if (!this.dataset) return;
-
-        if (this.dataset.isWholeGenome(this.state.chr1) && direction > 0) {
-            // jump from whole genome to chromosome
-            const genomeCoordX = centerPX * this.dataset.wholeGenomeResolution / this.state.pixelSize;
-            const genomeCoordY = centerPY * this.dataset.wholeGenomeResolution / this.state.pixelSize;
-            const chrX = this.genome.getChromsosomeForCoordinate(genomeCoordX);
-            const chrY = this.genome.getChromsosomeForCoordinate(genomeCoordY);
-            this.setChromosomes(chrX.index, chrY.index);
-        } else {
-            const resolutions = this.getResolutions();
-            const viewDimensions = this.contactMatrixView.getViewDimensions()
-            const dx = centerPX === undefined ? 0 : centerPX - viewDimensions.width / 2
-            const dy = centerPY === undefined ? 0 : centerPY - viewDimensions.height / 2
-
-            this.state.x += (dx / this.state.pixelSize);
-            this.state.y += (dy / this.state.pixelSize);
-
-            if (this.resolutionLocked ||
-                (direction > 0 && this.state.zoom === resolutions[resolutions.length - 1].index) ||
-                (direction < 0 && this.state.zoom === resolutions[0].index)) {
-
-                const minPS = await this.minPixelSize(this.state.chr1, this.state.chr2, this.state.zoom)
-                const state = this.state;
-                const newPixelSize = Math.max(Math.min(MAX_PIXEL_SIZE, state.pixelSize * (direction > 0 ? 2 : 0.5)), minPS);
-
-                const shiftRatio = (newPixelSize - state.pixelSize) / newPixelSize;
-                state.pixelSize = newPixelSize;
-                state.x += shiftRatio * (viewDimensions.width / state.pixelSize);
-                state.y += shiftRatio * (viewDimensions.height / state.pixelSize);
-
-                this.clamp();
-
-                let event = HICEvent("LocusChange", {
-                    state: state,
-                    resolutionChanged: false,
-                    chrChanged: false
-                })
-
-                this.update(event);
-                //this.eventBus.post(event);
-
-            } else {
-                let i;
-                for (i = 0; i < resolutions.length; i++) {
-                    if (this.state.zoom === resolutions[i].index) break;
-                }
-                if (i !== undefined) {
-                    const newZoom = resolutions[i + direction].index;
-                    this.setZoom(newZoom);
-                }
-            }
-        }
+        return this.interactions.zoomAndCenter(direction, centerPX, centerPY);
     }
 
     /**
@@ -990,589 +1361,736 @@ class HICBrowser {
      * @returns {Promise<void>}
      */
     async setZoom(zoom) {
+        return this.interactions.setZoom(zoom);
+    }
 
-        try {
-
-            // Shift x,y to maintain center, if possible
-            const bpResolutions = this.dataset.bpResolutions;
-            const currentResolution = bpResolutions[this.state.zoom];
-            const viewDimensions = this.contactMatrixView.getViewDimensions();
-            const xCenter = this.state.x + viewDimensions.width / (2 * this.state.pixelSize);    // center in bins
-            const yCenter = this.state.y + viewDimensions.height / (2 * this.state.pixelSize);    // center in bins
-
-            const newResolution = bpResolutions[zoom];
-            const newXCenter = xCenter * (currentResolution / newResolution);
-            const newYCenter = yCenter * (currentResolution / newResolution);
-            const minPS = await this.minPixelSize(this.state.chr1, this.state.chr2, zoom)
-            const state = this.state;
-            const newPixelSize = Math.max(DEFAULT_PIXEL_SIZE, minPS);
-            const zoomChanged = (state.zoom !== zoom);
-
-            state.zoom = zoom;
-            state.x = Math.max(0, newXCenter - viewDimensions.width / (2 * newPixelSize));
-            state.y = Math.max(0, newYCenter - viewDimensions.height / (2 * newPixelSize));
-            state.pixelSize = newPixelSize;
-            this.clamp();
-
-            await this.contactMatrixView.zoomIn()
-
-            let event = HICEvent("LocusChange", {
-                state: state,
-                resolutionChanged: zoomChanged,
-                chrChanged: false
-            })
-
-            this.update(event);
-            //this.eventBus.post(event);
-
-        } finally {
-            // this.stopSpinner()
-        }
-
-    };
-
-    async setChromosomes(chr1, chr2) {
-
-        try {
-            this.startSpinner()
-
-            const z = await this.minZoom(chr1, chr2)
-            this.state.chr1 = Math.min(chr1, chr2);
-            this.state.chr2 = Math.max(chr1, chr2);
-            this.state.x = 0;
-            this.state.y = 0;
-            this.state.zoom = z;
-
-            const minPS = await this.minPixelSize(this.state.chr1, this.state.chr2, this.state.zoom)
-            this.state.pixelSize = Math.min(100, Math.max(DEFAULT_PIXEL_SIZE, minPS));
-
-            let event = HICEvent("LocusChange", {state: this.state, resolutionChanged: true, chrChanged: true})
-
-            this.update(event);
-            //this.eventBus.post(event);
-
-        } finally {
-            this.stopSpinner()
-        }
+    async setChromosomes(xLocus, yLocus) {
+        return this.interactions.setChromosomes(xLocus, yLocus);
     }
 
     /**
      * Called on loading tracks
+     *
+     * It does **not** clamp. The `clampXY` call that stood here was the clamp's
+     * second enforcer, and `updateLayout` runs only when tracks change — so a
+     * restored session carrying a track was clamped incidentally and a bare map
+     * restore never was, and the same saved session opened two ways depending on
+     * whether it had a track. Restore goes through the chokepoint now, which
+     * clamps every time; this call would only be able to disagree with it.
+     * #558, ADR-0009 decision 4.
+     *
      * @returns {Promise<void>}
      */
     async updateLayout() {
 
-        this.clamp();
+        for (const trackXYPair of this.trackPairs) {
 
-        this.trackPairs.forEach(function (xyTrackRenderPair, index) {
-            sync(xyTrackRenderPair.x, index);
-            sync(xyTrackRenderPair.y, index);
-        });
+            trackXYPair.x.viewportElement.style.order = `${this.trackPairs.indexOf(trackXYPair)}`
+            trackXYPair.y.viewportElement.style.order = `${this.trackPairs.indexOf(trackXYPair)}`
 
-        function sync(trackRenderer, index) {
-            trackRenderer.$viewport.css({order: index});
-            trackRenderer.syncCanvas();
+            trackXYPair.x.syncCanvas()
+            trackXYPair.y.syncCanvas()
+
         }
 
-        this.layoutController.xAxisRuler.update();
-        this.layoutController.yAxisRuler.update();
+        this.layoutController.xAxisRuler.update()
+        this.layoutController.yAxisRuler.update()
 
-        await this.update();
+        setTrackReorderArrowColors(this.trackPairs)
+
+        await this.update()
 
     }
 
-
     /**
-     * Set the matrix state.  Used to restore state from a bookmark
+     * Restore a saved view. **The chokepoint, and a translator like every other
+     * mutation path** (#558, ADR-0009 decisions 2 and 4).
+     *
+     * This is the one writer of the state field. It used to be two methods --
+     * this one, and `StateManager.setState` behind it -- and #563 folded them
+     * together: the manager was a wrapper re-wrapped by ten accessors here, and
+     * once the behaviour left there was nothing on the far side of the
+     * delegation but the field itself.
+     *
+     * The six canonical fields arrive off the incoming state and are handed to
+     * `State.setView`. Restore used to clone and apply a bare
+     * `Math.max(pixelSize, minPixelSize)` floor of its own, which meant a saved
+     * view skipped the `MAX_PIXEL_SIZE` cap and the x/y clamp that every gesture
+     * path gets. It no longer does.
+     *
+     * **A restored state is clamped silently, never rejected.** That is the same
+     * rule the normalize stage one seam over follows (ADR-0006, #466): defaults
+     * and coerces, never refuses. The cost is deliberate and is in the release
+     * notes -- a saved view at `pixelSize=1e9`, or with an origin past the end of
+     * the chromosome, now opens somewhere different. Rejecting instead would
+     * turn a link that renders something into a link that renders nothing.
+     *
+     * The clone is what is mutated, so the caller's state object is left alone:
+     * `dataLoader` hands the same instance to `coordinator.onMapLoaded`.
+     *
+     * The dataset must already be installed -- `clampXY` reads its chromosome
+     * table and resolution ladder. All three production callers set it first,
+     * one line earlier; #559 makes that ordering explicit at the call sites.
+     *
+     * `resolutionChanged` is computed against the state going out of force, the
+     * same comparison `chrChanged` beside it makes, and for the same reason
+     * (#560, ADR-0009 decision 3). It used to be `true` unconditionally, so
+     * every restore announced a resolution change whether or not the resolution
+     * moved. What that announcement costs is the resolution lock: the
+     * coordinator releases it whenever the flag is set
+     * (`browserCoordinator.onLocusChange`), and it is handed on to external
+     * `onLocusChange` callbacks as contract. The repaint itself is not at stake
+     * -- `update()` runs on every restore, flag or no.
+     *
+     * The seventh field, `normalization`, is settled after `setView` rather than
+     * through it (#561, ADR-0009 decision 5): it is not one of the canonical six
+     * and it is validated against the dataset rather than against the view. See
+     * `#resolveNormalization` for why restore is the only place the question
+     * can be asked.
+     *
+     * Locus is not cached -- consumers derive it via state.getLocus().
+     *
      * @param state  browser state
      */
     async setState(state) {
 
-        const chrChanged = !this.state || this.state.chr1 !== state.chr1 || this.state.chr2 !== state.chr2;
-        this.state = state;
-        // Possibly adjust pixel size
-        const minPS = await this.minPixelSize(this.state.chr1, this.state.chr2, this.state.zoom)
-        this.state.pixelSize = Math.max(state.pixelSize, minPS);
+        // Both flags are asked of the state going out of force, in its own
+        // vocabulary: `_detectChromosomeChange` and `_detectResolutionChange`
+        // are the predicates `setView` itself uses, so the answer here and the
+        // answer on every gesture path cannot drift apart. No state in force is
+        // a change on both counts -- there is nothing to have been unchanged
+        // from, and `clearDataset()` nulls the state at the top of every load,
+        // so the first restore of a load lands there.
+        const chrChanged = !this.#state ||
+            this.#state._detectChromosomeChange(state.chr1, state.chr2);
 
-        let hicEvent = new HICEvent("LocusChange", {
+        const resolutionChanged = !this.#state ||
+            this.#state._detectResolutionChange(state.zoom);
+
+        const restored = state.clone();
+
+        // `setView`'s return is deliberately discarded. It runs on the clone,
+        // which already holds the incoming chromosomes and the incoming zoom, so
+        // its `chrChanged` and its `resolutionChanged` are both always false --
+        // the comparisons that mean anything are against the outgoing value of
+        // the state field, which are the ones computed above.
+        //
+        // The clone carries the incoming chr1/chr2 before `setView` runs, so
+        // `_adjustPixelSize` consults `minPixelSize` with the same arguments the
+        // hand-rolled floor above it used to.
+        await restored.setView(
+            state.chr1, state.chr2, state.x, state.y, state.zoom, state.pixelSize,
+            this,
+            this.dataset,
+            this.contactMatrixView.getViewDimensions()
+        );
+
+        const requestedNormalization = restored.normalization;
+        restored.normalization = await this.#resolveNormalization(requestedNormalization);
+
+        this.#state = restored;
+
+        // After the assignment, because the announcement is scoped to the view
+        // it is about and that view is the one now in force. Before `update()`
+        // and `onLocusChange`, which follow: both run on this same view, so
+        // neither retires it (#372, ADR-0012).
+        await this.#announceSubstitution(requestedNormalization, restored.normalization);
+
+        const eventData = {
             state: this.state,
-            resolutionChanged: true,
-            chrChanged: chrChanged
-        })
-
-        this.update(hicEvent);
-        this.eventBus.post(hicEvent);
+            resolutionChanged,
+            chrChanged
+        };
+        await this.update();
+        this.coordinator.onLocusChange(eventData);
     }
 
+    /**
+     * The normalization a restored state can actually be rendered with (#561,
+     * ADR-0009 decision 5).
+     *
+     * **Restore is the first moment this question can be asked, and the last
+     * moment it can be asked cheaply.** The set of valid normalizations does not
+     * exist until a dataset is loaded -- which is why candidate 9 found
+     * `config.normalization` to be one of exactly three fields the normalize
+     * stage provably cannot resolve, and left it alone. Downstream of here the
+     * answer is still knowable but no longer actionable: `imageTileSource`
+     * discovers the missing vector per tile, mid-render, and draws `NONE`
+     * without the canonical state ever admitting it changed. So the state that
+     * comes out of the chokepoint names a normalization the dataset has, and the
+     * render path stops being where the substitution silently happens.
+     *
+     * It is the same invariant as the clamp, at the same moment, and it follows
+     * the same rule: **coerce, never reject.** A saved link naming a
+     * normalization this map does not carry still opens, on `NONE` -- the
+     * fallback every `.hic` file offers. Refusing would turn a link that renders
+     * something into a link that renders nothing.
+     *
+     * **This is validation only.** #372 -- "a normalization that is not
+     * available renders without one and the user is not told" -- narrows to its
+     * notification half and stays open; no error surface belongs here.
+     *
+     * `NONE` short-circuits, and not merely as an optimization: on a real
+     * `.hic` file `getNormalizationOptions` reads the normalization vector index
+     * off the wire, so asking would put a network read on every restore to buy
+     * an answer that is already known. A state with no normalization at all is
+     * `NONE` for the same reason `State`'s constructor defaults it there.
+     *
+     * A dataset that cannot answer is not a licence to skip the check:
+     * `getNormalizationOptions` already answers `['NONE']` for a dataset without
+     * the method, and that is a sincere answer -- such a dataset offers nothing
+     * else. The one case that genuinely cannot be asked is no dataset at all,
+     * and the requested value stands there rather than being coerced against a
+     * set that was never consulted.
+     *
+     * It has two callers, not one: `init` resolves a top-level
+     * `config.normalization` here too. That field is not part of any saved state
+     * -- it is a config field a host sets alongside a map -- so it cannot arrive
+     * through `setState`, but it is the same question against the same set, and
+     * candidate 6's premise is that an invariant has one enforcer or none.
+     *
+     * Private, because both callers are inside this class and `js/publicApi.js`
+     * is the manifest of what a host may reach. It was public on `StateManager`,
+     * which was not published surface at all; landing it on `HICBrowser`
+     * unmarked would have made it contract by accident, which ADR-0003's
+     * "absence is not permission" is precisely about.
+     *
+     * @param {string|undefined} requested - The normalization asked for
+     * @returns {Promise<string>} - A normalization the loaded dataset offers
+     */
+    async #resolveNormalization(requested) {
+
+        if (undefined === requested || 'NONE' === requested) {
+            return 'NONE';
+        }
+
+        if (!this.dataset) {
+            return requested;
+        }
+
+        const available = await this.getNormalizationOptions();
+
+        if (available.includes(requested)) {
+            return requested;
+        }
+
+        // The fallback is read out of the offered set rather than assumed to be
+        // `NONE`. Every `.hic` file seeds its normalization list with `NONE`, so
+        // on a single map the two are the same answer -- but with a control map
+        // loaded this set is an *intersection* of two files' lists, and an
+        // intersection is an expression rather than a guarantee. Where it does
+        // hold `NONE`, or where it is empty and there is nothing to name, `NONE`
+        // is both the answer and what the render path would have drawn anyway.
+        if (0 === available.length || available.includes('NONE')) {
+            return 'NONE';
+        }
+
+        return available[0];
+    }
+
+    /**
+     * Tell the user when the answer differs from the request.
+     *
+     * Both of `#resolveNormalization`'s callers ask this immediately after
+     * asking it, which is what makes one enforcer also one notification path
+     * (#372, ADR-0012 decision 1). Split from the enforcer rather than folded
+     * into it so the enforcer stays a pure question with a pure answer -- it is
+     * asked in a restore and in `init`, and only the callers know which view
+     * the answer is about.
+     *
+     * Two of the three reasons are chosen here, and the question that separates
+     * them is asked of the *primary* file, not of the control map's presence.
+     * With a control map loaded `getNormalizationOptions` returns an
+     * intersection, and a normalization missing from an intersection is missing
+     * for one of two quite different causes: the primary file never had it, or
+     * the primary file has it and the control map does not. Only the second is
+     * fixed by unloading the control map, and telling a user to unload a map
+     * that will not bring their vector back is worse than telling them nothing.
+     * So the primary file is asked directly. The third reason belongs to the
+     * render pass and is worded there.
+     *
+     * @param {string|undefined} requested - what was asked for
+     * @param {string} resolved - what will be drawn
+     */
+    async #announceSubstitution(requested, resolved) {
+
+        if (undefined === requested || requested === resolved) {
+            return;
+        }
+
+        const inPrimaryFile = this.dataset && this.dataset.getNormalizationOptions
+            ? (await this.dataset.getNormalizationOptions()).includes(requested)
+            : false;
+
+        const reason = inPrimaryFile
+            ? substitutionReason.notInBothMaps(requested, resolved)
+            : substitutionReason.notInFile(requested, resolved);
+
+        this.coordinator.onNormalizationSubstituted(resolved, reason);
+    }
 
     /**
      * Return a modified state object used for synching.  Other datasets might have different chromosome ordering
-     * and resolution arrays
+     * and resolution arrays.
+     *
+     * The projection itself is `State.getSyncState(dataset)`; what is here is
+     * the "is there anything to publish yet" question, which is about the
+     * browser rather than about the view.
      */
     getSyncState() {
-        return {
-            chr1Name: this.dataset.chromosomes[this.state.chr1].name,
-            chr2Name: this.dataset.chromosomes[this.state.chr2].name,
-            binSize: this.dataset.bpResolutions[this.state.zoom],
-            binX: this.state.x,            // TODO -- tranlsate to lower right corner
-            binY: this.state.y,
-            pixelSize: this.state.pixelSize
-        };
+        if (!this.dataset || !this.state) {
+            return undefined;
+        }
+        return this.state.getSyncState(this.dataset);
     }
 
     /**
-     * Return true if this browser can be synched to the given state
-     * @param syncState
+     * Take a sync state published by a sibling browser.
+     *
+     * The guard is `isSynchable` from `syncGroup.js` -- the same expression
+     * `pairSynchable` reads, so #562 left the `synchable` rule written down
+     * once. (`canBeSynched` was the third reader until #566 deleted it with the
+     * `config.synchState` rung.) The guard itself stays here rather than being
+     * left to the callers: `syncToOtherBrowsers` walks `synchedBrowsers`, a set
+     * `registry.sync()` last rebuilt, so a browser whose host flipped
+     * `synchable` since then is still in it. That was master's behaviour and
+     * the ticket does not change what syncing does.
+     *
+     * The second half of the gate is `canResolveSyncState`, also from
+     * `syncGroup.js`: a state naming a chromosome this browser's genome cannot
+     * place is skipped rather than carried into `State.sync`, which would throw
+     * on it (#605). An assert since #632 -- see the comment there.
      */
-    canBeSynched(syncState) {
-
-        if(false === this.synchable) return false;   // Explicitly not synchable
-
-        return this.dataset &&
-            (this.dataset.getChrIndexFromName(syncState.chr1Name) !== undefined) &&
-            (this.dataset.getChrIndexFromName(syncState.chr2Name) !== undefined);
-
-    }
-
-    /**
-     * Used to synch state with other browsers
-     * @param state  browser state
-     */
-    syncState(syncState) {
-
-        if(!syncState || false === this.synchable) return;
-
-        if (!this.dataset) return;
-
-        var chr1 = this.genome.getChromosome(syncState.chr1Name),
-            chr2 = this.genome.getChromosome(syncState.chr2Name),
-            zoom = this.dataset.getZoomIndexForBinSize(syncState.binSize, "BP"),
-            x = syncState.binX,
-            y = syncState.binY,
-            pixelSize = syncState.pixelSize;
-
-        if (!(chr1 && chr2)) {
-            return;   // Can't be synched.
+    async syncState(targetState) {
+        if (!targetState || !isSynchable(this) || !this.state) {
+            return;
         }
 
-        if (zoom === undefined) {
-            // Get the closest zoom available and adjust pixel size.   TODO -- cache this somehow
-            zoom = this.findMatchingZoomIndex(syncState.binSize, this.dataset.bpResolutions);
-
-            // Compute equivalent in basepairs / pixel
-            pixelSize = (syncState.pixelSize / syncState.binSize) * this.dataset.bpResolutions[zoom];
-
-            // Translate bins so that origin is unchanged in basepairs
-            x = (syncState.binX / syncState.pixelSize) * pixelSize;
-            y = (syncState.binY / syncState.pixelSize) * pixelSize;
-
-            if (pixelSize > MAX_PIXEL_SIZE) {
-                console.log("Cannot synch map " + this.dataset.name + " (resolution " + syncState.binSize + " not available)");
-                return;
-            }
+        // Unreachable by construction since #632: `pairSynchable` admits only
+        // pairs with two-way chromosome parity, so every state a partner
+        // publishes names chromosomes this genome can place. If it fires, the
+        // pairing rule is wrong -- a message for us, on `console.error`, and not
+        // for the host, which `onSyncRefused` carried here until #632 and which
+        // the user can no longer have caused. ADR-0016 decision 5.
+        if (!canResolveSyncState(this.genome, targetState)) {
+            console.error(`juicebox: the sync pairing rule admitted a pair it should not have -- this map has no ${[targetState.chr1Name, targetState.chr2Name].join(' / ')}`);
+            return;
         }
 
+        const { zoomChanged, chrChanged } = await this.state.sync(targetState, this, this.genome, this.dataset);
 
-        const zoomChanged = (this.state.zoom !== zoom);
-        const chrChanged = (this.state.chr1 !== chr1.index || this.state.chr2 !== chr2.index);
-        this.state.chr1 = chr1.index;
-        this.state.chr2 = chr2.index;
-        this.state.zoom = zoom;
-        this.state.x = x;
-        this.state.y = y;
-        this.state.pixelSize = pixelSize;
-
-        let event = HICEvent("LocusChange", {
+        // For sync, we don't want to propagate back to other browsers (would cause infinite loop)
+        // So we update without syncing
+        await this.update(false);
+        
+        // Notify UI components (scrollbars, locus display, etc.) of the state change
+        // This ensures synchronized browsers update their UI elements properly
+        const eventData = {
             state: this.state,
             resolutionChanged: zoomChanged,
-            chrChanged: chrChanged
-        }, false)
+            chrChanged
+        };
+        this.coordinator.onLocusChange(eventData);
+    }
 
-        this.update(event)
-        //this.eventBus.post(event);
-
+    /**
+     * Show why this panel cannot join any sync group, or -- given `undefined`
+     * -- that it can. The isolation mark beside the contact-map label; the
+     * reason is its tooltip. ADR-0016 decisions 7-8, #637.
+     *
+     * Internal: the registry calls it right after recomputing membership, with
+     * what `isolationReasons` in `syncGroup.js` decided, and nothing else does.
+     * That is what keeps the mark still while the user pans -- it moves only
+     * when the open maps do.
+     *
+     * @param {string|undefined} reason
+     */
+    setIsolationReason(reason) {
+        this.isolationMark.hidden = undefined === reason;
+        this.isolationMark.title = reason ?? '';
     }
 
     setNormalization(normalization) {
-
-        this.state.normalization = normalization;
-        this.eventBus.post(HICEvent("NormalizationChange", this.state.normalization))
-    }
-
-    shiftPixels(dx, dy) {
-
-        if (!this.dataset) return;
-        this.state.x += (dx / this.state.pixelSize);
-        this.state.y += (dy / this.state.pixelSize);
-        this.clamp();
-
-        const locusChangeEvent = HICEvent("LocusChange", {
-            state: this.state,
-            resolutionChanged: false,
-            dragging: true,
-            chrChanged: false
-        });
-        locusChangeEvent.dragging = true;
-
-        this.update(locusChangeEvent);
-        this.eventBus.post(locusChangeEvent);
-    }
-
-    goto(chr1, bpX, bpXMax, chr2, bpY, bpYMax, minResolution) {
-
-        const viewDimensions = this.contactMatrixView.getViewDimensions();
-        const bpResolutions = this.getResolutions();
-        const currentResolution = bpResolutions[this.state.zoom].binSize;
-        const viewWidth = viewDimensions.width;
-
-        if (!bpXMax) {
-            bpX = Math.max(0, bpX - Math.floor(viewWidth * currentResolution / 2));
-            bpXMax = bpX + viewWidth * currentResolution;
+        if (this.#state) {
+            this.#state.normalization = normalization;
         }
-        if (!bpYMax) {
-            bpY = Math.max(0, bpY - Math.floor(viewDimensions.height * currentResolution / 2));
-            bpYMax = bpY + viewDimensions.height * currentResolution;
-        }
-
-        let targetResolution = Math.max((bpXMax - bpX) / viewDimensions.width, (bpYMax - bpY) / viewDimensions.height);
-
-        if (minResolution && targetResolution < minResolution) {
-            const maxExtent = viewWidth * minResolution;
-            const xCenter = (bpX + bpXMax) / 2;
-            const yCenter = (bpY + bpYMax) / 2;
-            bpX = Math.max(xCenter - maxExtent / 2);
-            bpY = Math.max(0, yCenter - maxExtent / 2);
-            targetResolution = minResolution;
-        }
-
-        let zoomChanged;
-        let newZoom;
-        if (true === this.resolutionLocked && minResolution === undefined) {
-            zoomChanged = false;
-            newZoom = this.state.zoom;
-        } else {
-            newZoom = this.findMatchingZoomIndex(targetResolution, bpResolutions);
-            zoomChanged = (newZoom !== this.state.zoom);
-        }
-
-        const newResolution = bpResolutions[newZoom].binSize;
-        const newPixelSize = Math.min(MAX_PIXEL_SIZE, Math.max(1, newResolution / targetResolution));
-        const newXBin = bpX / newResolution;
-        const newYBin = bpY / newResolution;
-
-        const chrChanged = !this.state || this.state.chr1 !== chr1 || this.state.chr2 !== chr2;
-        this.state.chr1 = chr1;
-        this.state.chr2 = chr2;
-        this.state.zoom = newZoom;
-        this.state.x = newXBin;
-        this.state.y = newYBin;
-        this.state.pixelSize = newPixelSize;
-
-        this.contactMatrixView.clearImageCaches();
-
-
-        let event = HICEvent("LocusChange", {
-            state: this.state,
-            resolutionChanged: zoomChanged,
-            chrChanged: chrChanged
-        })
-
-        this.update(event);
-        //this.eventBus.post(event);
-
-    }
-
-    clamp() {
-        var viewDimensions = this.contactMatrixView.getViewDimensions(),
-            chr1Length = this.dataset.chromosomes[this.state.chr1].size,
-            chr2Length = this.dataset.chromosomes[this.state.chr2].size,
-            binSize = this.dataset.bpResolutions[this.state.zoom],
-            maxX = (chr1Length / binSize) - (viewDimensions.width / this.state.pixelSize),
-            maxY = (chr2Length / binSize) - (viewDimensions.height / this.state.pixelSize);
-
-        // Negative maxX, maxY indicates pixelSize is not enough to fill view.  In this case we clamp x, y to 0,0
-        maxX = Math.max(0, maxX);
-        maxY = Math.max(0, maxY);
-
-
-        this.state.x = Math.min(Math.max(0, this.state.x), maxX);
-        this.state.y = Math.min(Math.max(0, this.state.y), maxY);
-    }
-
-    receiveEvent(event) {
-        // if ("LocusChange" === event.type) {
-        //     if (event.propogate) {
-        //         for (let browser of this.synchedBrowsers) {
-        //             browser.syncState(this.getSyncState());
-        //         }
-        //     }
-        //     this.update(event);
-        // }
+        this.coordinator.onNormalizationChange(this.#state?.normalization);
     }
 
     /**
-     * Update the maps and tracks.  This method can be called from the browser event thread repeatedly, for example
-     * while mouse dragging.  If called while an update is in progress queue the event for processing later.  It
-     * is only neccessary to queue the most recent recently received event, so a simple instance variable will suffice
-     * for the queue.
+     * Record a substitution: the view is being drawn with something other than
+     * what was asked for, because what was asked for is not on offer here.
      *
-     * @param event
+     * The sibling of `setNormalization` above, and deliberately not a call to
+     * it. `setNormalization` is the user answering the question and repaints on
+     * the way out; a substitution is discovered *during* a render pass -- by
+     * `imageTileSource`, or by hic-straw's `alert` hook from inside a tile
+     * fetch -- and repainting from there is a re-entrancy hazard, not a
+     * cleanup. So the write is direct, which is the exception documented at
+     * `docs/state-manipulation.md`.
+     *
+     * Sticky, per ADR-0012 decision 3: state is rewritten to name what is
+     * drawn, so a zoom back out to a resolution that does carry the vector
+     * stays on the substitute until the user asks again. Keeping the request in
+     * state and re-attempting each pass is the lie ADR-0009 removed.
+     *
+     * Both mid-render callers land here rather than each writing the triple out
+     * themselves, so "sticky, direct, no repaint" is one rule in one place.
+     * `#announceSubstitution` does not: it is the restore-time coercion, whose
+     * state write belongs to `#resolveNormalization`'s caller and whose reason
+     * is one of the other two.
+     *
+     * @param {string|undefined} requested - what the render pass asked for
+     * @param {string} effective - what it can actually draw with
      */
-    async update(event) {
+    substituteNormalization(requested, effective) {
+
+        if (!this.#state || !requested || requested === effective) {
+            return;
+        }
+
+        this.#state.normalization = effective;
+        this.coordinator.onNormalizationSubstituted(
+            effective,
+            substitutionReason.notAtThisView(requested, effective)
+        );
+    }
+
+    async shiftPixels(dx, dy) {
+        await this.interactions.shiftPixels(dx, dy);
+    }
+
+    /**
+     * Pure rendering method - repaints all visual components.
+     * Reads state directly from browser state, no parameters needed.
+     * This is the core rendering logic, separate from the update coordination
+     * (spinner, re-entrancy, sync) in update().
+     */
+    async repaint() {
+
+        if (!this.dataset || !this.state) {
+            return; // Can't render without dataset and state
+        }
+
+        const pseudoEvent = {
+            type: "LocusChange",
+            data: { state: this.state }
+        };
+        this.layoutController.xAxisRuler.locusChange(pseudoEvent);
+        this.layoutController.yAxisRuler.locusChange(pseudoEvent);
+
+        // Render all tracks and contact matrix in parallel
+        const promises = this.trackPairs.map(xy => xy.updateViews());
+        promises.push(this.contactMatrixView.update());
+        await Promise.all(promises);
+    }
+
+    /**
+     * Set the resolution lock: the field, the padlock, and -- on a real
+     * transition -- the peers.
+     *
+     * The one writer for a **view preference** (`CONTEXT.md`), and the first of
+     * the category to mirror across a sync group (ADR-0014). Three callers used
+     * to write `resolutionLocked` and separately remember to call
+     * `setResolutionLock` on the widget; forgetting the second half is a padlock
+     * that lies about the browser it sits on, so the pairing lives here instead
+     * of in each of them. The constructor's `this.resolutionLocked = false` is
+     * left alone: it declares the field, and it runs before either the widget or
+     * `synchedBrowsers` exists.
+     *
+     * **Every transition mirrors, not just the user's click.** The lock is a
+     * claim about the group, so whatever voids it on one browser voids it on all
+     * of them -- a resolution change, a map load, or the padlock being clicked
+     * open. The alternative, mirroring only the click, left the padlocks free to
+     * disagree in exactly the case that had already been flagged: a peer whose
+     * dataset lacks the matching rung reports `zoomChanged: false`, keeps its
+     * lock, and shows an icon the group has stopped agreeing with. Parity was
+     * the point of the feature, so tolerating a parity break was incoherent.
+     *
+     * `changed` is what makes that affordable. Without it every resolution
+     * change in a never-locked session would fan out to announce that nothing
+     * happened, and a mirrored clear would do O(N^2) hops as each peer's own
+     * auto-clear re-broadcast. With it the hot path is one comparison, fan-out
+     * happens only on a real transition, and the recursion question does not
+     * arise: a peer set to a value it already holds stops there.
+     *
+     * The map-load clear reaches the peers through a set `clearDataset()` has
+     * half torn down -- it removes this browser from *their* sets but leaves
+     * this browser's own, deliberately, because it is still on the page and
+     * `registry.sync()` re-pairs it (`hicBrowser.js:676`, #492). That asymmetry
+     * is documented intent, and it is what lets a map load say "the group's lock
+     * is void" on its way past.
+     *
+     * @param {boolean} locked
+     * @param {Object} [options]
+     * @param {boolean} [options.mirror=false] - fan out to the sync group
+     */
+    setResolutionLocked(locked, {mirror = false} = {}) {
+
+        const changed = this.resolutionLocked !== locked;
+        this.resolutionLocked = locked;
+
+        if (!changed) {
+            return;
+        }
+
+        this.coordinator?.widgets?.resolutionSelector?.setResolutionLock(locked);
+
+        if (mirror) {
+            for (const browser of [...this.synchedBrowsers]) {
+                browser.setResolutionLocked(locked);
+            }
+        }
+    }
+
+    /**
+     * Synchronize this browser's state to other synched browsers.
+     * Called separately from rendering to keep concerns separated.
+     */
+    syncToOtherBrowsers() {
+        if (this.synchedBrowsers.size === 0) {
+            return; // Nothing to sync
+        }
+
+        const syncState = this.getSyncState()
+        for (const browser of [...this.synchedBrowsers]) {
+            browser.syncState(syncState)
+        }
+    }
+
+    /**
+     * Public API for updating/repainting the browser.
+     *
+     * Handles queuing for rapid calls (e.g. during a mouse drag). A call arriving
+     * while an update is in flight is remembered rather than run, and only the most
+     * recent one runs when the in-flight update finishes.
+     *
+     * One spinner start/stop pair per call, and nothing inside repaint() starts
+     * another. A trailing update is awaited inside the finally, before the outer
+     * stop, so its pair nests within the outer one and the shared count never
+     * reaches zero mid-drag -- the spinner goes up once and comes down once.
+     *
+     * @param shouldSync - Whether to synchronize state to other browsers (default: true)
+     *                     Set to false when called from syncState() to avoid infinite loops
+     */
+    async update(shouldSync = true) {
 
         if (this.updating) {
-            const type = event ? event.type : "NONE";
-            this.pending.set(type, event);
-        } else {
-            this.updating = true;
-            try {
+            this.pendingUpdate = { shouldSync };
+            return;
+        }
 
-                this.startSpinner();
-                if (event !== undefined && "LocusChange" === event.type) {
-                    this.layoutController.xAxisRuler.locusChange(event);
-                    this.layoutController.yAxisRuler.locusChange(event);
-                }
-
-                const promises = []
-
-                for (let xyTrackRenderPair of this.trackPairs) {
-                    promises.push(this.renderTrackXY(xyTrackRenderPair));
-                }
-                promises.push(this.contactMatrixView.update(event));
-                await Promise.all(promises);
-
-                if (event && event.propogate) {
-                    let syncState1 = this.getSyncState();
-                    for (let browser of this.synchedBrowsers) {
-                        browser.syncState(syncState1);
-                    }
-                }
-
-            } finally {
-                this.updating = false;
-                if (this.pending.size > 0) {
-                    const events = []
-                    for (let [k, v] of this.pending) {
-                        events.push(v);
-                    }
-                    this.pending.clear();
-                    for (let e of events) {
-                        this.update(e)
-                    }
-                }
-                if (event) {
-                    // possibly, unless update was called from an event post (infinite loop)
-                    this.eventBus.post(event)
-                }
-                this.stopSpinner();
+        this.updating = true;
+        try {
+            this.startSpinner();
+            await this.repaint();
+            this.#refreshCrosshairs();
+            if (shouldSync) {
+                this.syncToOtherBrowsers();
             }
+        } finally {
+            this.updating = false;
+            const queued = this.pendingUpdate;
+            if (queued) {
+                this.pendingUpdate = undefined;
+                await this.update(queued.shouldSync);
+            }
+            this.stopSpinner();
         }
     }
 
     repaintMatrix() {
-        this.contactMatrixView.imageTileCache = {};
-        this.contactMatrixView.initialImage = undefined;
-        this.contactMatrixView.update();
+        this.contactMatrixView.clearImageCaches()
+        this.contactMatrixView.update()
     }
 
     resolution() {
-        return this.dataset.bpResolutions[this.state.zoom];
+        return this.binSizeForZoom()
     };
 
-
+    /**
+     * Serialize this browser as a session entry, or `null` when it has no map.
+     *
+     * A browser with no dataset names nothing a session can restore, and `null`
+     * is what says so to the registry, which drops it. It used to be the string
+     * `"{}"`, which was neither a browser nor distinguishable from one: the
+     * defaults pass on restore assigned properties to a string primitive and
+     * the whole session failed to reload. ADR-0006 decision 6, #500.
+     */
     toJSON() {
 
-        if (!(this.dataset && this.dataset.url)) return "{}";   // URL is required
+        if (!(this.dataset && this.dataset.url)) return null   // URL is required
 
-        const jsonOBJ = {};
+        const jsonOBJ = {}
 
         jsonOBJ.backgroundColor = this.contactMatrixView.stringifyBackgroundColor()
-        jsonOBJ.url = this.dataset.url;
+        jsonOBJ.url = this.dataset.url
         if (this.dataset.name) {
-            jsonOBJ.name = this.dataset.name;
+            jsonOBJ.name = this.dataset.name
         }
-        jsonOBJ.state = this.state.stringify();
-        jsonOBJ.colorScale = this.contactMatrixView.getColorScale().stringify();
-        if (Globals.selectedGene) {
-            jsonOBJ.selectedGene = Globals.selectedGene;
+
+        jsonOBJ.state = this.state.toJSON()
+
+        jsonOBJ.colorScale = this.contactMatrixView.getColorScale().stringify()
+        if (this.registry.selectedGene) {
+            jsonOBJ.selectedGene = this.registry.selectedGene
         }
-        let nviString = getNviString(this.dataset);
+        let nviString = this.dataset.hicFile.config.nvi
         if (nviString) {
-            jsonOBJ.nvi = nviString;
+            jsonOBJ.nvi = nviString
         }
         if (this.controlDataset) {
-            jsonOBJ.controlUrl = this.controlUrl;
+            jsonOBJ.controlUrl = this.controlUrl
             if (this.controlDataset.name) {
-                jsonOBJ.controlName = this.controlDataset.name;
+                jsonOBJ.controlName = this.controlDataset.name
             }
-            const displayMode = this.getDisplayMode();
+            const displayMode = this.getDisplayMode()
             if (displayMode) {
-                jsonOBJ.displayMode = this.getDisplayMode();
+                jsonOBJ.displayMode = this.getDisplayMode()
             }
-            nviString = getNviString(this.controlDataset);
+            nviString = this.controlDataset.hicFile.config.nvi
             if (nviString) {
-                jsonOBJ.controlNvi = nviString;
+                jsonOBJ.controlNvi = nviString
             }
-            if (this.controlMapWidget.getDisplayModeCycle() !== undefined) {
-                jsonOBJ.cycle = true;
+            const controlMapWidget = this.coordinator.widgets.controlMapWidget;
+            if (controlMapWidget.getDisplayModeCycle() !== undefined) {
+                jsonOBJ.cycle = true
             }
         }
 
         if (this.trackPairs.length > 0 || this.tracks2D.length > 0) {
-            let tracks = [];
-            jsonOBJ.tracks = tracks;
-            for (let trackRenderer of this.trackPairs) {
-                const track = trackRenderer.x.track;
-                const config = track.config;
-                if (typeof config.url === "string") {
-                    const t = {
-                        url: config.url
-                    }
-                    if (track.name) {
-                        t.name = track.name;
-                    }
-                    if (track.dataRange) {
-                        t.min = track.dataRange.min;
-                        t.max = track.dataRange.max;
-                    }
-                    if (track.color) {
-                        t.color = track.color;
-                    }
-                    tracks.push(t);
+            let tracks = []
+            jsonOBJ.tracks = tracks
+            for (const trackPair of this.trackPairs) {
+                // A pending track is written from its config, so a save made
+                // while it loads keeps it. A failed or dismissed track has no
+                // row, so it is not written. ADR-0017 decision 5, #666.
+                const t = trackPair.isPendingTrack ?
+                    sessionTrack(trackPair.config, pendingTrackLook(trackPair)) :
+                    sessionTrack(trackPair.x.track.config, trackPair.x.track)
+                if (t) {
+                    tracks.push(t)
                 }
-
             }
-            for (let track of this.tracks2D) {
-                var config = track.config;
-                if (typeof config.url === "string") {
-                    const t = {
-                        url: config.url
-                    }
-                    if (track.name) {
-                        t.name = track.name;
-                    }
-                    if (track.color) {
-                        t.color = track.color;
-                    }
-                    tracks.push(t);
+            for (const track2D of this.tracks2D) {
+                if (typeof track2D.config.url === "string") {
+                    tracks.push(track2D.toJSON())
                 }
             }
         }
 
-        return jsonOBJ;
+        return jsonOBJ
     }
-
 
     async minZoom(chr1, chr2) {
 
-        const viewDimensions = this.contactMatrixView.getViewDimensions();
+        if (!this.dataset) {
+            throw new Error("Dataset not available for minZoom calculation");
+        }
+
         const chromosome1 = this.dataset.chromosomes[chr1]
-        const chromosome2 = this.dataset.chromosomes[chr2];
-        const chr1Length = chromosome1.size;
-        const chr2Length = chromosome2.size;
-        const binSize = Math.max(chr1Length / viewDimensions.width, chr2Length / viewDimensions.height);
+        const chromosome2 = this.dataset.chromosomes[chr2]
+
+        if (!chromosome1 || !chromosome2) {
+            throw new Error(`Invalid chromosome indices: ${chr1}, ${chr2}`);
+        }
+
+        const { width, height } = this.contactMatrixView.getViewDimensions()
+        const binSize = Math.max(chromosome1.size / width, chromosome2.size / height)
+
+        // `findZoomForResolution` floors at the coarsest *declared* bin, so on a
+        // large single scaffold it answers with a rung that cannot frame the
+        // thing at all. The only coarser data in the file is the whole-genome
+        // matrix, which for this assembly is the same picture -- so the fit
+        // falls through to the sentinel rung. ADR-0010 fact 3.
+        //
+        // Asked of the rungs actually on offer, not of the primary map's raw
+        // ladder: on an A/B map the coarsest *common* bin can be finer than the
+        // primary's coarsest, and a scaffold that map cannot frame either has
+        // to fall through too. The list is sorted coarsest-first, and the
+        // sentinel is filtered back out so the question stays "is anything
+        // declared coarse enough".
+        if (this.dataset.isSingleChromosome()) {
+            const declared = this.getResolutions().filter(({index}) => SENTINEL_ZOOM !== index)
+            if (0 === declared.length || declared[0].binSize < binSize) {
+                return SENTINEL_ZOOM
+            }
+        }
 
         const matrix = await this.dataset.getMatrix(chr1, chr2)
         if (!matrix) {
-            throw new Error(`Data not avaiable for chromosomes ${chromosome1.name} - ${chromosome2.name}`);
+            throw new Error(`Data not avaiable for chromosomes ${chromosome1.name} - ${chromosome2.name}`)
         }
-        return matrix.findZoomForResolution(binSize);
+        return matrix.findZoomForResolution(binSize)
     }
 
-    async minPixelSize(chr1, chr2, z) {
+    async minPixelSize(chr1, chr2, zoomIndex) {
 
-        const viewDimensions = this.contactMatrixView.getViewDimensions();
-        const chr1Length = this.dataset.chromosomes[chr1].size;
-        const chr2Length = this.dataset.chromosomes[chr2].size;
+        if (!this.dataset) {
+            // If dataset not yet set, return default minimum
+            return DEFAULT_PIXEL_SIZE;
+        }
+
+        // bp
+        if (!this.dataset.chromosomes || !this.dataset.chromosomes[chr1] || !this.dataset.chromosomes[chr2]) {
+            console.warn(`Invalid chromosome indices or chromosomes array not initialized: ${chr1}, ${chr2}`);
+            return DEFAULT_PIXEL_SIZE;
+        }
+
+        const chr1Length = this.dataset.chromosomes[chr1].size
+        const chr2Length = this.dataset.chromosomes[chr2].size
+
+        // The sentinel rung is sized against the scaffold, not against the
+        // whole-genome matrix's own zoom record. Both describe the same 500-bin
+        // span, but the matrix states it in the kb it stores its coordinates in
+        // while `chr1Length` here is bp -- reading the record would divide one
+        // unit by the other. `wholeGenomeResolution` is that same bin in bp,
+        // which is what makes this a unit match. ADR-0010 fact 4.
+        if (SENTINEL_ZOOM === zoomIndex) {
+            const binSize = this.dataset.wholeGenomeResolution
+            const { width, height } = this.contactMatrixView.getViewDimensions();
+            return Math.min(width / (chr1Length / binSize), height / (chr2Length / binSize));
+        }
 
         const matrix = await this.dataset.getMatrix(chr1, chr2)
-        const zd = matrix.getZoomDataByIndex(z, "BP");
-        const binSize = zd.zoom.binSize;
-        const nBins1 = chr1Length / binSize;
-        const nBins2 = chr2Length / binSize;
-        return (Math.min(viewDimensions.width / nBins1, viewDimensions.height / nBins2));
-
-    }
-}
-
-
-function extractName(config) {
-    if (config.name === undefined) {
-        const urlOrFile = config.url;
-        if (isFile(urlOrFile)) {
-            return urlOrFile.name;
-        } else {
-            const str = urlOrFile.split('?').shift();
-            const idx = urlOrFile.lastIndexOf("/");
-            return idx > 0 ? str.substring(idx + 1) : str;
+        if (!matrix) {
+            console.warn(`Matrix not available for chromosomes ${chr1}, ${chr2}`);
+            return DEFAULT_PIXEL_SIZE;
         }
-    } else {
-        return config.name;
+
+        const zoomData = matrix.getZoomDataByIndex(zoomIndex, "BP");
+        if (!zoomData || !zoomData.zoom) {
+            // Fallback: try to get zoom data for index 0, or use dataset resolution
+            const fallbackZoomData = matrix.getZoomDataByIndex(0, "BP");
+            if (!fallbackZoomData || !fallbackZoomData.zoom) {
+                // Last resort: use dataset resolution directly
+                const binSize = this.dataset.bpResolutions[zoomIndex] || this.dataset.bpResolutions[0] || 1000;
+                const nBins1 = chr1Length / binSize;
+                const nBins2 = chr2Length / binSize;
+                const { width, height } = this.contactMatrixView.getViewDimensions();
+                return Math.min(width / nBins1, height / nBins2);
+            }
+            const zoom = fallbackZoomData.zoom;
+            const nBins1 = chr1Length / zoom.binSize;
+            const nBins2 = chr2Length / zoom.binSize;
+            const { width, height } = this.contactMatrixView.getViewDimensions();
+            return Math.min(width / nBins1, height / nBins2);
+        }
+
+        const { zoom } = zoomData;
+
+        // bin = bp * bin/bp = bin
+        const nBins1 = chr1Length / zoom.binSize
+        const nBins2 = chr2Length / zoom.binSize
+
+        const { width, height } = this.contactMatrixView.getViewDimensions()
+
+        // pixel/bin
+        return Math.min(width / nBins1, height / nBins2)
+
     }
 }
 
-function getNviString(dataset) {
-
-    return dataset.hicFile.config.nvi
-    // if (dataset.hicFile.normalizationVectorIndexRange) {
-    //     var range = dataset.hicFile.normalizationVectorIndexRange,
-    //         nviString = String(range.start) + "," + String(range.size);
-    //     return nviString
-    // } else {
-    //     return undefined;
-    // }
-}
-
-// parseUri 1.2.2
-// (c) Steven Levithan <stevenlevithan.com>
-// MIT License
-
-function parseUri(str) {
-    var o = parseUri.options,
-        m = o.parser[o.strictMode ? "strict" : "loose"].exec(str),
-        uri = {},
-        i = 14;
-
-    while (i--) uri[o.key[i]] = m[i] || "";
-
-    uri[o.q.name] = {};
-    uri[o.key[12]].replace(o.q.parser, function ($0, $1, $2) {
-        if ($1) uri[o.q.name][$1] = $2;
-    });
-
-    return uri;
-}
-
-parseUri.options = {
-    strictMode: false,
-    key: ["source", "protocol", "authority", "userInfo", "user", "password", "host", "port", "relative", "path", "directory", "file", "query", "anchor"],
-    q: {
-        name: "queryKey",
-        parser: /(?:^|&)([^&=]*)=?([^&]*)/g
-    },
-    parser: {
-        strict: /^(?:([^:\/?#]+):)?(?:\/\/((?:(([^:@]*)(?::([^:@]*))?)?@)?([^:\/?#]*)(?::(\d*))?))?((((?:[^?#\/]*\/)*)([^?#]*))(?:\?([^#]*))?(?:#(.*))?)/,
-        loose: /^(?:(?![^:@]+:[^:@\/]*@)([^:\/?#.]+):)?(?:\/\/)?((?:(([^:@]*)(?::([^:@]*))?)?@)?([^:\/?#]*)(?::(\d*))?)(((\/(?:[^?#](?![^?#\/]*\.[^?#\/.]+(?:[?#]|$)))*\/?)?([^?#\/]*))(?:\?([^#]*))?(?:#(.*))?)/
-    }
-};
-
-function replaceAll(str, target, replacement) {
-    return str.split(target).join(replacement);
-}
-
-function presentError(prefix, error) {
-    const httpMessages = {
-        "401": "Access unauthorized",
-        "403": "Access forbidden",
-        "404": "Not found"
-    }
-    var msg = error.message;
-    if (httpMessages.hasOwnProperty(msg)) {
-        msg = httpMessages[msg];
-    }
-    Alert.presentAlert(prefix + ": " + msg);
-
-}
-
+export { MAX_PIXEL_SIZE, DEFAULT_PIXEL_SIZE, DisposedBrowserError }
 export default HICBrowser
 

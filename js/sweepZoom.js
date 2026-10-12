@@ -21,101 +21,51 @@
  *
  */
 
-/**
- * Created by dat on 3/14/17.
- */
-
 class SweepZoom {
 
-    constructor(browser, $target) {
-
+    constructor(browser, targetElement) {
         this.browser = browser;
+        this.targetElement = targetElement;
 
-        this.$target = $target;
-
-        this.$rulerSweeper = $target.find("div[id$='-sweep-zoom-container']");
-        this.$rulerSweeper.hide();
+        this.rulerSweeperElement = targetElement.querySelector("div[id$='-sweep-zoom-container']");
+        this.rulerSweeperElement.style.display = 'none';
 
         this.sweepRect = {};
     }
 
-    initialize(pageCoords) {
-
-        this.anchor = pageCoords;
-        this.coordinateFrame = this.$rulerSweeper.parent().offset();
-        this.aspectRatio = this.$target.width() / this.$target.height();
-        this.sweepRect.x = {
-            x: pageCoords.x,
-            y: pageCoords.y,
-            width: 1,
-            height: 1
-        };
-        this.clipped = {value: false};
+    initialize(startX, startY) {
+        this.rulerSweeperElement.style.left = `${startX}px`;
+        this.rulerSweeperElement.style.top = `${startY}px`;
+        this.rulerSweeperElement.style.width = '0px';
+        this.rulerSweeperElement.style.height = '0px';
+        this.rulerSweeperElement.style.display = 'block';
     }
 
-    update(pageCoords) {
-
-        var anchor = this.anchor,
-            dx = Math.abs(pageCoords.x - anchor.x),
-            dy = Math.abs(pageCoords.y - anchor.y);
-
-        // Adjust deltas to conform to aspect ratio
-        if (dx / dy > this.aspectRatio) {
-            dy = dx / this.aspectRatio;
-        } else {
-            dx = dy * this.aspectRatio;
-        }
-
-        this.sweepRect.width = dx;
-        this.sweepRect.height = dy;
-        this.sweepRect.x = anchor.x < pageCoords.x ? anchor.x : anchor.x - dx;
-        this.sweepRect.y = anchor.y < pageCoords.y ? anchor.y : anchor.y - dy;
-
-
-        this.$rulerSweeper.width(this.sweepRect.width);
-        this.$rulerSweeper.height(this.sweepRect.height);
-
-
-        this.$rulerSweeper.offset(
-            {
-                left: this.sweepRect.x,
-                top: this.sweepRect.y
-            }
-        );
-        this.$rulerSweeper.show();
-
+    update({ left, top, width, height }) {
+        this.rulerSweeperElement.style.width = width
+        this.rulerSweeperElement.style.height = height
+        this.rulerSweeperElement.style.left = left
+        this.rulerSweeperElement.style.top = top
     }
 
-    commit() {
+    async commit({ xPixel, yPixel, width, height }) {
 
-
-        this.$rulerSweeper.hide();
+        this.rulerSweeperElement.style.display = 'none';
 
         const state = this.browser.state;
-
-        // bp-per-bin
-        const resolution = this.browser.resolution();
-
-        // Convert page -> offset coordinates
-        const posX = this.sweepRect.x - this.$target.offset().left;
-        const posY = this.sweepRect.y - this.$target.offset().top;
-
+        const { chromosomes } = this.browser.dataset;
+        const bpResolution = this.browser.binSizeForZoom(state.zoom);
 
         // bp = ((bin + pixel/pixel-per-bin) / bp-per-bin)
-        const x = (state.x + (posX / state.pixelSize)) * resolution;
-        const y = (state.y + (posY / state.pixelSize)) * resolution;
+        const xBP = (state.x + (xPixel / state.pixelSize)) * bpResolution
+        const yBP = (state.y + (yPixel / state.pixelSize)) * bpResolution
+        const  widthBP = ( width / state.pixelSize) * bpResolution;
+        const heightBP = (height / state.pixelSize) * bpResolution;
 
-        // bp = ((bin + pixel/pixel-per-bin) / bp-per-bin)
-        const width = (this.sweepRect.width / state.pixelSize) * resolution;
-        const height = (this.sweepRect.height / state.pixelSize) * resolution;
-
-        // bp = bp + bp
-        const xMax = x + width;
-        const yMax = y + height;
-
-        const minimumResolution = this.browser.dataset.bpResolutions[this.browser.dataset.bpResolutions.length - 1];
-        this.browser.goto(state.chr1, x, xMax, state.chr2, y, yMax, minimumResolution);
-
+        await this.browser.goto(
+            chromosomes[state.chr1].name, Math.round(xBP), Math.round(xBP + widthBP),
+            chromosomes[state.chr2].name, Math.round(yBP), Math.round(yBP + heightBP),
+        );
     }
 }
 

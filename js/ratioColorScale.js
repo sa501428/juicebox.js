@@ -21,71 +21,26 @@
  *
  */
 
-import ColorScale from './colorScale.js'
+import SignedColorScale from './signedColorScale.js'
 
 const defaultRatioColorScaleConfig = {threshold: 5, positive: {r: 255, g: 0, b: 0}, negative: {r: 0, g: 0, b: 255}}
 
-class RatioColorScale {
+/**
+ * Color scale for the AOB / BOA display modes.
+ *
+ * Ratio scores are positive and centered on 1, so the log puts them on a signed
+ * axis: below 1 takes the negative side, above 1 the positive.
+ */
+class RatioColorScale extends SignedColorScale {
 
-    constructor(threshold) {
+    static tag = 'R:'
 
-        this.threshold = threshold;
-
-        this.positiveScale = new ColorScale({
-            threshold: Math.log(threshold),
-            r: 255,
-            g: 0,
-            b: 0
-        });
-        this.negativeScale = new ColorScale(
-            {
-                threshold: Math.log(threshold),
-                r: 0,
-                g: 0,
-                b: 255
-            })
+    constructor(threshold = defaultRatioColorScaleConfig.threshold) {
+        super(threshold, defaultRatioColorScaleConfig)
     }
 
-    setThreshold(threshold) {
-        this.threshold = threshold;
-        this.positiveScale.setThreshold(Math.log(threshold));
-        this.negativeScale.setThreshold(Math.log(threshold));
-    }
-
-    getThreshold() {
-        return this.threshold;
-    }
-
-    setColorComponents(components, plusOrMinus) {
-        if ('-' === plusOrMinus) {
-            return this.negativeScale.setColorComponents(components);
-        } else {
-            return this.positiveScale.setColorComponents(components);
-        }
-    }
-
-    getColorComponents(plusOrMinus) {
-
-        if ('-' === plusOrMinus) {
-            return this.negativeScale.getColorComponents();
-        } else {
-            return this.positiveScale.getColorComponents();
-        }
-    }
-
-    getColor(score) {
-
-        var logScore = Math.log(score);
-
-        if (logScore < 0) {
-            return this.negativeScale.getColor(-logScore);
-        } else {
-            return this.positiveScale.getColor(logScore);
-        }
-    }
-
-    stringify() {
-        return "R:" + this.threshold + ":" + this.positiveScale.stringify() + ":" + this.negativeScale.stringify();
+    transform(value) {
+        return Math.log(value)
     }
 }
 

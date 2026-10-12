@@ -1,0 +1,233 @@
+/**
+ * The dataset a restore lands on, standing in for a `.hic` file.
+ *
+ * `test/utils/stubbedLoads.js` stubs `loadHicFile` *whole*, which is exactly
+ * wrong for #557: `loadHicFile` is the ladder under test. So the seam moves one
+ * step out to the thing behind it -- `Dataset.loadDataset`, the network read --
+ * and everything above it runs for real: the ladder, `browser.setState`,
+ * `State.setView`, `clampXY`, `browser.minPixelSize`.
+ *
+ * That makes the stub load-bearing in a way `stubbedLoads`' is not. Three of the
+ * numbers in the golden are read off it, so it carries real ones:
+ *
+ * - **chromosome sizes** are hg19's. `clampXY` bounds the origin at
+ *   `chromosomes[chr].size / binSize - viewport / pixelSize`, so a made-up size
+ *   would make every clamp in the file fictional.
+ * - **`bpResolutions`** is the standard nine-entry juicer ladder. The corpus's
+ *   harvested states carry zoom indices up to 7; a shorter array would turn a
+ *   real fixture into an out-of-range one.
+ * - **`getMatrix`** answers with the zoom record `browser.minPixelSize` reads,
+ *   which is what puts the stated viewport into `pixelSize`.
+ *
+ * Nothing here reads a byte or a pixel. `getNormVectorIndex` is deliberately
+ * absent rather than stubbed: `loadHicFile` guards on its presence, so omitting
+ * it is how a test says "no normalization vector index", and a fixture carrying
+ * `nvi=` takes that branch honestly.
+ */
+
+/** hg19, the genome every harvested fixture in the corpus was published against. */
+const HG19 = [
+    ['chr1', 249250621], ['chr2', 243199373], ['chr3', 198022430], ['chr4', 191154276],
+    ['chr5', 180915260], ['chr6', 171115067], ['chr7', 159138663], ['chr8', 146364022],
+    ['chr9', 141213431], ['chr10', 135534747], ['chr11', 135006516], ['chr12', 133851895],
+    ['chr13', 115169878], ['chr14', 107349540], ['chr15', 102531392], ['chr16', 90354753],
+    ['chr17', 81195210], ['chr18', 78077248], ['chr19', 59128983], ['chr20', 63025520],
+    ['chr21', 48129895], ['chr22', 51304566], ['chrX', 155270560], ['chrY', 59373566],
+]
+
+/** The standard juicer resolution ladder, coarsest first — `zoom` indexes this. */
+const BP_RESOLUTIONS = [2500000, 1000000, 500000, 250000, 100000, 50000, 25000, 10000, 5000]
+
+function chromosomes() {
+    const named = HG19.map(([name, size], i) => ({index: i + 1, name, size}))
+    const wholeGenome = {index: 0, name: 'All', size: named.reduce((sum, c) => sum + c.size, 0)}
+    return [wholeGenome, ...named]
+}
+
+/**
+ * The single-chromosome assembly ADR-0010 is about: the `All` entry plus one
+ * real scaffold, 2.4 Gbp -- the size #398 reports, and the size at which no
+ * declared bin can frame the thing.
+ *
+ * Two numbers here are faithful to the format in a way the hg19 stand-in above
+ * is not, because ADR-0010's arithmetic reads them:
+ *
+ * - the `All` entry's `size` is in **kb** (`hic-straw/src/hicFile.js:141`), so
+ *   it is the genome length over 1000.
+ * - `wholeGenomeResolution` is that same bin expressed in **bp**: `size * 2`,
+ *   which is the genome length over 500. Five hundred bins across the scaffold.
+ */
+const SOLE_SCAFFOLD_SIZE = 2400000000
+
+function singleChromosomes() {
+    const scaffold = {index: 1, name: 'scaffold_1', size: SOLE_SCAFFOLD_SIZE}
+    const wholeGenome = {index: 0, name: 'All', size: SOLE_SCAFFOLD_SIZE / 1000}
+    return [wholeGenome, scaffold]
+}
+
+/**
+ * The zoom record `minPixelSize` and `minZoom` read. `findZoomForResolution`
+ * mirrors `browser.findMatchingZoomIndex`: the finest index whose bin is still
+ * no smaller than the target, floored at the whole-genome resolution.
+ */
+function matrix() {
+    return {
+        getZoomDataByIndex(index, unit) {
+            const binSize = BP_RESOLUTIONS[index]
+            return binSize === undefined ? undefined : {zoom: {index, unit, binSize}}
+        },
+        findZoomForResolution(binSize) {
+            for (let z = BP_RESOLUTIONS.length - 1; z > 0; z--) {
+                if (BP_RESOLUTIONS[z] >= binSize) return z
+            }
+            return 0
+        },
+    }
+}
+
+/**
+ * @param {object} [config] — the config the loader was called with, so the
+ *   dataset can echo the identity `loadHicFile` then reads back off it.
+ */
+export function restoreDataset(config = {}) {
+    return buildDataset(chromosomes(), config)
+}
+
+/**
+ * The same stand-in over a one-scaffold assembly (#236, ADR-0010). Everything
+ * the sentinel path reads is real here: the predicate answers true, the
+ * whole-genome matrix answers at its own single resolution, and
+ * `wholeGenomeResolution` is the bp bin the sentinel rung carries.
+ */
+export function singleChromosomeDataset(config = {}) {
+    const chrs = singleChromosomes()
+    return {
+        ...buildDataset(chrs, config),
+        genomeId: config.genomeId || 'sole-scaffold',
+        wholeGenomeResolution: chrs[0].size * 2,
+        // The whole-genome matrix carries exactly one BP resolution, stated in
+        // the kb its own coordinates are in -- `wholeGenomeResolution / 1000`.
+        async getMatrix(chr1, chr2) {
+            if (0 === chr1 && 0 === chr2) return wholeGenomeMatrix(chrs[0].size * 2 / 1000)
+            return matrix()
+        },
+    }
+}
+
+function wholeGenomeMatrix(binSize) {
+    return {
+        getZoomDataByIndex(index, unit) {
+            return 0 === index
+                ? {zoom: {index, unit: unit || 'BP', binSize}, chr1: {index: 0, name: 'All'}, chr2: {index: 0, name: 'All'}}
+                : undefined
+        },
+        findZoomForResolution() {
+            return 0
+        },
+    }
+}
+
+function buildDataset(chrs, config) {
+
+    return {
+        url: config.url,
+        name: config.name,
+        // hg19 unless the caller names another. The override exists for the
+        // sync suites, whose whole question is whether two datasets name the
+        // same genome; nothing in the restore corpus passes one.
+        genomeId: config.genomeId || 'hg19',
+        datasetType: 'hic',
+        chromosomes: chrs,
+        bpResolutions: BP_RESOLUTIONS,
+        // Stands in for `Dataset.isCompatible`, and does **not** reproduce it.
+        // The shipping method short-circuits on three known genome-id pairs
+        // (hg19/GRCh37, hg38/GRCh38, mm10/GRCm38) and otherwise falls to
+        // `compareChromosomes`, which compares the chromosomes two tables share
+        // (#626). This is a bare id comparison: on this fixture, same id is
+        // always compatible and every other pairing is refused.
+        //
+        // That is the right answer for the suites here -- they are about the
+        // restore ladder, and want a compatibility rule that is one line of a
+        // test's own arithmetic rather than the assembly question. It is the
+        // wrong answer for anyone whose subject *is* the compatibility rule: a
+        // test standing on this fixture is testing this override, not
+        // `isCompatible`, and it errs in both directions -- it will pair maps
+        // the shipping rule refuses, and refuse maps it pairs, hg19 against
+        // GRCh37 among them. That second direction is #626's cause A, which no
+        // suite on this fixture could have caught.
+        //
+        // A compatibility-rule test builds on the real `Dataset.prototype` --
+        // see `test/testSyncOnLoad.js`, which does exactly that and is why the
+        // bug was visible at all. It cannot be done from here: this fixture is a
+        // plain object literal on no prototype, and the file imports nothing on
+        // purpose (see `datasetModule` below), so there is no real method to
+        // fall through to. Deleting the override is not an option -- made to
+        // throw, it takes 48 tests across eight suites down. #628.
+        isCompatible(other) {
+            return other?.genomeId === this.genomeId
+        },
+        // Stands in for `Dataset.canSyncWith`, the sync-pairing predicate
+        // (ADR-0016), and carries the caveat above twice over. The shipping
+        // method is `isCompatible` **and** two-way chromosome parity through
+        // `Genome.getChromosome`; this is the same bare id comparison, and
+        // never reads a chromosome table. So a fixture cut down to `All` +
+        // `chr1` still pairs here with a whole-genome one -- exactly the pair
+        // the shipping rule refuses since #632. A test whose subject is who
+        // pairs with whom builds on the real prototype: `testSyncParity.js`.
+        canSyncWith(other) {
+            return other?.genomeId === this.genomeId
+        },
+        wholeGenomeChromosome: chrs[0],
+        isWholeGenome(chrIndex) {
+            return chrIndex === 0
+        },
+        // The four ADR-0010 methods, implemented rather than stubbed, so a
+        // fixture over a different chromosome table answers honestly.
+        isSingleChromosome() {
+            return 2 === chrs.length
+        },
+        soleChromosome() {
+            return 2 === chrs.length ? chrs[1] : undefined
+        },
+        binSizeForZoom(zoom) {
+            return -1 === zoom ? this.wholeGenomeResolution : BP_RESOLUTIONS[zoom]
+        },
+        matrixViewForZoom(chr1, chr2, zoom) {
+            return -1 === zoom ? {chr1: 0, chr2: 0, zoomIndex: 0} : {chr1, chr2, zoomIndex: zoom}
+        },
+        getChrIndexFromName(name) {
+            const found = chrs.find(c => c.name.toLowerCase() === String(name).toLowerCase())
+            return found === undefined ? undefined : found.index
+        },
+        async getMatrix() {
+            return matrix()
+        },
+        hicFile: {config: {nvi: config.nvi}},
+    }
+}
+
+/**
+ * The module shape a `vi.mock('../js/hicDataset.js')` factory has to return:
+ * `loadDataset` for the ladder, and a `HiCDataset` class for the callers that
+ * construct one. The four restore suites (#571) all return this.
+ *
+ * It lives beside the dataset rather than in `restoreFixture.js` because a mock
+ * factory runs *inside* the module graph it is mocking: a factory that imported
+ * the fixture would pull `hicBrowser.js` back in through it, and the load would
+ * deadlock on itself. This file imports nothing.
+ *
+ * `build` is a `config => dataset` function -- ordinarily `restoreDataset`
+ * itself, and a wrapper around it for a suite that needs the dataset to answer
+ * one more question.
+ */
+export function datasetModule(build) {
+    return {
+        default: {loadDataset: async config => build(config)},
+        HiCDataset: class {
+            constructor(config) {
+                Object.assign(this, build(config))
+            }
+            async init() {}
+        },
+    }
+}

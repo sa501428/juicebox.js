@@ -1,20 +1,36 @@
-import {createBrowserList, deleteAllBrowsers, getAllBrowsers, syncBrowsers} from "./createBrowser.js"
-import {Globals} from "./globals.js"
-import {StringUtils} from "../node_modules/igv-utils/src/index.js";
+import {registryForContainer, currentRegistry} from "./browserRegistry.js"
+import {encodeSession} from "./sessionCodec.js";
 
+/**
+ * The exported session functions -- the names both known host apps import, per
+ * ADR-0003.
+ *
+ * A session describes *one embed*, so the work is `registry.toJSON()` and
+ * `registry.restoreSession(config)`; these three keep their published
+ * signatures and delegate. Decision 5 of ADR-0004, #482.
+ *
+ * What is left here rather than on the registry is the caption: a single
+ * `#hic-caption` element outside every container, which two embeds on a page
+ * share and no registry can own.
+ */
+
+/**
+ * Serialize a session: the browsers of one embed, its selected gene, and the
+ * page caption.
+ *
+ * Which embed is the page-wide one, because `toJSON()` is a published
+ * zero-argument export with no container to resolve from -- the same
+ * single-embed convenience `getAllBrowsers()` carries. Once resolved, the whole
+ * document comes from that one registry: `registry.toJSON()` is where a session
+ * is actually written. Decision 5 of ADR-0004, #482.
+ */
 function toJSON() {
-    const jsonOBJ = {};
-    const browserJson = [];
-    const allBrowsers = getAllBrowsers();
-    for (let browser of allBrowsers) {
-        browserJson.push(browser.toJSON());
-    }
-    jsonOBJ.browsers = browserJson;
 
-    if (Globals.selectedGene) {
-        jsonOBJ["selectedGene"] = Globals.selectedGene;
-    }
+    const jsonOBJ = currentRegistry()?.toJSON() || {browsers: []};
 
+    // The caption is the one part of a session no registry owns: it is a single
+    // page element outside every container, so it is read here rather than in
+    // the registry. Two embeds on a page share it.
     const captionDiv = document.getElementById('hic-caption');
     if (captionDiv) {
         var captionText = captionDiv.textContent;
@@ -29,33 +45,47 @@ function toJSON() {
     return jsonOBJ;
 }
 
+/**
+ * The share link's query parameter: `session=blob:<compressed JSON>`, which
+ * juicebox-web appends to its base href.
+ *
+ * The writing is `sessionCodec.encodeSession` -- the inverse of the same
+ * module's `decodeSession`, and the reason `decode(encode(x))` can be a property
+ * test at all (#507, ADR-0006 decision 4). It was two lines of compression here,
+ * which is one of the two halves of the format living apart from the other.
+ */
 function compressedSession() {
-    const jsonString = JSON.stringify(toJSON());
-    return `session=blob:${StringUtils.compressString(jsonString)}`
+    return encodeSession(toJSON())
 }
 
 
+/**
+ * Replace the browsers in `container`'s embed with the ones `session` names.
+ *
+ * The container argument has always implied this, and since #479 keyed
+ * registries by container it has been true. What #482 adds is that the session
+ * is the *registry's* -- restoring is something one embed does to itself, not a
+ * page-wide operation aimed at a container. A host initializing a second embed
+ * keeps the first one's DOM either way; #384.
+ *
+ * It resolves once every browser's map is usable -- its maps, normalization
+ * vectors, normalization and colour scale applied, and the interaction shield
+ * down -- and **before its tracks have loaded**. A 1D track still loading is a
+ * pending track, shown as a placeholder row; a 2D track draws when it arrives.
+ * A track that fails is reported in the alert dialog, possibly after this has
+ * resolved. There is no signal for "tracks loaded": a host that needs a track
+ * waits for it itself. #667, ADR-0017 decision 1.
+ */
 async function restoreSession(container, session) {
 
-    deleteAllBrowsers();
-
-    if (session.hasOwnProperty("selectedGene")) {
-        Globals.selectedGene = session.selectedGene;
-    }
-    if (session.hasOwnProperty("caption")) {
-        const captionText = session.caption;
-        var captionDiv = document.getElementById("hic-caption");
+    if (Object.hasOwn(session, "caption")) {
+        const captionDiv = document.getElementById("hic-caption");
         if (captionDiv) {
-            captionDiv.textContent = captionText;
+            captionDiv.textContent = session.caption;
         }
     }
 
-    await createBrowserList(container, session);
-
-    if (false !== session.syncDatasets) {
-        syncBrowsers();
-    }
-
+    await registryForContainer(container).restoreSession(session);
 }
 
 

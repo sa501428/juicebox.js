@@ -1,0 +1,748 @@
+/**
+ * The golden-file characterization test for the **resolved state after
+ * restore**. #557, candidate 6's gate, scoped by ADR-0009.
+ *
+ * **Nothing in the restore path moves until this file is green.** It is the
+ * third instrument of the same kind: #503 snapshots the decoded session, #531
+ * the resolved config, and the stage between them -- the state a `.hic` load
+ * actually hands the browser -- is exactly what candidate 6 moves. The corpus
+ * from #502 is the input for all three, so a fixture added there is covered on
+ * every seam.
+ *
+ * ## The four doors
+ *
+ * `dataLoader.loadHicFile` walks a three-rung ladder -- a config-level `locus`, a
+ * `state` token, and the `State.default()` fallback -- and
+ * `dataLoader.loadLiveContactMap` is a fourth door walking its own copy of the
+ * middle of it. Only two rungs reach `browser.setState`.
+ *
+ * There were five until #566, whose `config.synchState` column is described in
+ * finding 3 below.
+ *
+ * All four are here, not the two candidate 6 touches. #504 is the reason: the
+ * live-map path had drifted from the file path and lost a rung of the same
+ * ladder -- a numeric `state` crashed on one path and opened the default view on
+ * the other -- and nothing caught it. A golden scoped to the doors you are
+ * touching cannot see the door you are not.
+ *
+ * ## Two stated viewports, and why they are stated
+ *
+ * The honest in-harness measurement of the viewport is `{width: 0, height: 0}`:
+ * the test environment is `node`, JSDOM is opt-in per suite, and JSDOM does no
+ * layout in any case (ADR-0009 fact 5). So the fixture states a viewport; there
+ * is no alternative, and a test that read a live measurement would be recording
+ * zero and calling it a clamp.
+ *
+ * It states *two* because candidate 6's whole claim is that clamping happens on
+ * restore, and at a single viewport a golden cannot tell a clamp from a
+ * coincidence. `clampXY` bounds the origin at
+ * `chromosome.size / binSize - viewport / pixelSize` and `minPixelSize` divides
+ * the viewport by the bin count, so both are viewport-dependent -- and the two
+ * sizes here differ on both axes and in aspect, so a value that moves between
+ * the columns is a value the viewport reached. The sizes are written into the
+ * snapshot as a `viewport` field rather than implied by the column name.
+ *
+ * ## What is snapshotted
+ *
+ * Per fixture, per browser config in it, per door, per viewport:
+ *
+ * - **`presented`** -- the config the door was handed. Doors take different
+ *   spellings of the same view, so this says which one, in full.
+ * - **`rungs`** -- which of `parseGotoInput`, `setState` and `syncState` the
+ *   load actually called. The ladder's branch is an observation here, not an
+ *   inference from the input: a rung that stops running is the failure this file
+ *   exists to catch, and it would otherwise show up only as a state that moved.
+ * - **`state`** -- the resolved `State` off the live browser, field by field,
+ *   plus `getLocus` projected at the same stated viewport.
+ *   `setActiveDataset` counts the dataset installs. It is not a rung; it is the
+ *   back door beside the ladder, and until #559 a companion count --
+ *   `setActiveDataset(state)` -- said how many states each door installed
+ *   through it. That parameter is gone, so the companion count is gone with it;
+ *   `test/testRestoreBackDoor.js` is where the door being *closed* is asserted,
+ *   which a count of zero could never say.
+ *
+ * A fixture that differs from another only in its tracks or its colour scale
+ * produces an identical record here, and that is correct: restore reads the
+ * state and the URL and nothing else. The corpus is driven whole anyway, because
+ * "which config fields restore reads" is a fact about today that a later ticket
+ * could change without anyone noticing.
+ *
+ * ## No behaviour moves in this ticket
+ *
+ * This file adds a test surface and nothing else. Where a snapshot looks wrong
+ * it is recorded as-is, with a note here saying so -- the point is to pin what
+ * happens *today*, so that the next ticket's diff has something to be read
+ * against. Three are known, and all three were found by reading the baseline:
+ *
+ * 1. **No door clamps.** The `state` door does not, because
+ *    `StateManager.setState` applied a `minPixelSize` floor directly and never
+ *    calls `_adjustPixelSize` or `clampXY`. The `locus` door does not either, on
+ *    the branch a real link takes: `State.updateWithLoci` passes
+ *    `{clampXY: false}`, so only the whole-chromosome branch through
+ *    `setChromosomesView` clamps at all. That is ADR-0009's premise recorded as
+ *    data rather than argued: the invariant has no enforcer on restore, and the
+ *    live door's record below is what it costs.
+ * 2. **The live-map door's `state` rung is overwritten one line later, and lands
+ *    outside the chromosome.** `loadLiveContactMap` decodes `config.state`,
+ *    calls `setState`, and then unconditionally calls `parseGotoInput` on the
+ *    live extent -- so the state a live session carries never survives its own
+ *    load (#650). And because `parseLocusString` converts to 0-based by
+ *    subtracting one, an extent starting at 0 became `-1` bp, which nothing
+ *    clamps, so every live record in this file had a **negative** origin. That
+ *    half is fixed: #567 made the formatter add the one back, and the live
+ *    column now opens at `0, 0`.
+ *
+ *    The live door was the worst case, not the only one: the same subtraction
+ *    reaches the file path's `locus` door whenever the projected locus starts at
+ *    bp 0, and roughly a sixth of the `config.locus` records here carry a small
+ *    negative `x` for that reason. #567 did not touch that door -- its input is
+ *    the fixture's locus, not a formatter of juicebox's -- and #649 is where
+ *    `updateWithLoci` would clamp it. A negative origin outside the live column is
+ *    therefore **baseline**, not a regression -- it is finding 1 showing through,
+ *    since no door clamps.
+ * 3. **The `config.synchState` rung was unreachable, and is now gone.** Its
+ *    guard needed an `activeDataset` that `loadHicFile` had just cleared four
+ *    lines earlier, so a config carrying a `synchState` silently took the
+ *    fallback rung -- cold or primed alike, which is why this file drove that
+ *    door *primed* and still recorded the fallback. Filed as #566, and #566
+ *    deleted the rung rather than repairing it: it was the 2017 mechanism for
+ *    syncing a newly created panel, superseded three months later by the sync
+ *    step at the end of `loadHicFile`, and no caller had supplied the key
+ *    since. Its column left this file with it. Sync between browsers is
+ *    untouched -- it goes through `registry.sync()` and `browser.syncState()`
+ *    and never went through this rung.
+ *
+ * ## Updating a snapshot — the convention
+ *
+ * Unchanged from #503 and #531, and it applies here for the same reason: a bare
+ * `vitest -u` is exactly what makes a deliberate movement and an accidental one
+ * indistinguishable.
+ *
+ * 1. Read the diff fixture by fixture. A column you did not expect to move is a
+ *    bug report, not a snapshot to accept.
+ * 2. Update only what moved -- `vitest -u -t '<fixture id>'`, never a bare `-u`.
+ * 3. Add a row to the log below naming the ticket that authorised it.
+ *
+ * ### What moves a snapshot legitimately
+ *
+ * - A **door changing which rung it takes** -- ADR-0009 decision 1 routes every
+ *   door through the chokepoint, so `rungs` moves for the doors that skipped it.
+ * - A **clamp arriving** -- an `x` or `y` outside `[0, chromosome/binSize]`
+ *   coming back inside it. Some `config.locus` records are negative today, so
+ *   those are the ones to read first. Expect a clamp to move one viewport column and
+ *   not the other; that asymmetry is the evidence it is a clamp and not a
+ *   coincidence, and it is the whole reason there are two columns.
+ * - A **`pixelSize` cap arriving** -- a value above `MAX_PIXEL_SIZE` coming down
+ *   to it, once restore runs `_adjustPixelSize`.
+ * - A **normalization coerced against the dataset** (ADR-0009 decision 5).
+ * - **`setActiveDataset(state)` disappearing**, as decision 1 removes the
+ *   parameter. It went from every door at once, in #559.
+ * - **A door's own input corrected** -- a locus juicebox formats for itself
+ *   being formatted right. It moves one door in both columns by the same
+ *   amount, which is what tells it apart from a clamp. #567.
+ *
+ * And what does **not**: a `locus` projection moving without its `state` moving
+ * -- `getLocus` is a pure function of the fields above it, so that combination
+ * is a change to the projection and not to restore. Nor a value moving in both
+ * viewport columns by the same amount, which is the signature of a change to the
+ * default view rather than to the clamp. Nor `rungs` losing a `setActiveDataset`
+ * call while the state beside it stays put, which would mean the dataset stopped
+ * being installed.
+ *
+ * ### Authorised snapshot movements
+ *
+ * | Date | Fixtures | Authorised by |
+ * |------|----------|---------------|
+ * | 2026-08-22 | all — baseline taken | #557. No production code changed; this is the gate, taken before candidate 6 moves anything. #510 landed first, so the fallback door records a y-origin of 0 rather than baking that defect in. |
+ * | 2026-08-22 | `harvested-query-degron-fully-encoded`, `harvested-query-gm12878-nvi` — the `config.state` door, `1600x400` column only | #558. Restore goes through `setView`, so the clamp reaches it. Tally below. |
+ * | 2026-08-22 | all — the `rungs` field only, on every door | #559. `setActiveDataset` loses its `state` parameter, so the count of calls carrying one leaves the file, and the `config.locus` door reaches `setState` where it did not before. Tally below. |
+ * | 2026-08-22 | 10 fixtures — the `normalization` field only, on the `config.state` and live doors, both columns | #561. A restored normalization is coerced against the loaded dataset. Tally below. |
+ * | 2026-08-24 | `session-gzip-data-uri` — one entry **added**, none moved | **#518**, ADR-0011 decision 2. The corpus fixture that used to reject now decodes, so this suite — which runs the decoding fixtures — sees it for the first time. An addition rather than a movement: a fixture with no prior entry has nothing to disagree with. The decoded session is one browser naming `https://example.org/a.hic`, which is what the fixture's note has always said its payload holds. Logged so that "one new entry and nothing else changed" is a claim a reader of the diff can check; the movement itself is logged in `testDecoderGolden.js`. |
+ * | 2026-09-14 | all — the live door only, both columns | #567. The live extent's locus string gains the one `parseLocusString` takes away, so the live door opens at `0, 0`. Tally below. |
+ *
+ * ### The #558 tally
+ *
+ * **Two records of 450 moved** (45 browser configs x 5 doors x 2 viewports),
+ * and both movements are of one kind:
+ *
+ * - **A clamp arriving on x, in the wide column only — 2 records.** Both are the
+ *   `config.state` door at `1600x400`, and in both the saved origin sits inside
+ *   the chromosome but too close to its end for a 1600px-wide viewport to fit.
+ *   `degron`: chr3 is `198022430 / 10000 = 19802.243` bins at zoom 7, so
+ *   `maxX = 19802.243 - 1600/1.55 = 18769.985` and the saved `19215` comes back
+ *   to it. `gm12878`: chr1 is `249250621 / 100000 = 2492.506` bins at zoom 4, so
+ *   `maxX = 2492.506 - 1600/1 = 892.506` and the saved `1115.253` comes back to
+ *   it. Each `locus` moved with its `state`, as a projection must. **Neither
+ *   moved in the `800x800` column** — at 800px the bound is 516 and 800 bins
+ *   looser respectively, and both origins fit. That asymmetry is the evidence
+ *   this is a clamp and not a coincidence, and it is what the second viewport
+ *   was added for.
+ * - **No `y` moved.** Both fixtures are intrachromosomal with the y origin at or
+ *   below the x origin, and the wide column is only 400px tall, so `maxY` never
+ *   binds. A clamp that bit on one axis and not the other is the expected shape.
+ * - **No `pixelSize` moved, and no `MAX_PIXEL_SIZE` cap fired.** The corpus's
+ *   largest saved `pixelSize` is `8.02`, two orders below the cap of `128`, so
+ *   the cap this ticket adds is unreachable from any harvested link. That is why
+ *   #558's acceptance criteria ask for a written test rather than a snapshot:
+ *   `test/testRestoreClamp.js` drives `pixelSize=1e9` through the door and pins
+ *   the coercion, which no fixture here can. The cap is not the only pixelSize
+ *   coercion restore now inherits — `_adjustPixelSize` opens with
+ *   `Math.max(1, target)`, so a saved `pixelSize` below 1 would come up to 1
+ *   even where `minPixelSize` is lower. No record here exercises that either;
+ *   the corpus's smallest saved `pixelSize` is 1. It is named so that "no
+ *   `pixelSize` moved" is not read as "no `pixelSize` could have".
+ * - **No `rungs` moved, and `setActiveDataset(state)` is still 1 on the doors
+ *   that call it.** #558 is decisions 2 and 4 only; the parameter goes in #559,
+ *   which is the row below this tally.
+ * - **The live door's negative origins are unchanged** — all still negative.
+ *   Finding 2 above is `parseGotoInput` running *after* `setState`, and
+ *   `updateWithLoci` passes `{clampXY: false}`, so routing restore through the
+ *   chokepoint cannot reach it. #567 is still the ticket for that, and the same
+ *   is true of the `config.locus` door's small negative `x` values, and of the
+ *   two `config.locus` records that resolve to `NaN` throughout: a clamp cannot
+ *   repair a `NaN` — `Math.min(Math.max(0, NaN), maxX)` is `NaN` — and that door
+ *   does not reach `setState` in any case.
+ * - **Nothing moved on the `State.default()` fallback door** (its origin is
+ *   `0, 0` and its `pixelSize` `1`, all in range) or on the `config.synchState`
+ *   door (still unreachable, still recording the fallback — #566).
+ *
+ * A second movement class the ticket authorised did **not** appear: nothing was
+ * rejected, and every record still reads `"outcome": "restores"`. Coerced,
+ * never refused (ADR-0009 decision 2).
+ *
+ * ### The #559 tally
+ *
+ * Every record moved, and **only `rungs` moved** -- not one field of one
+ * `state`, in either column, on any of the five doors. Two line shapes account
+ * for the whole diff:
+ *
+ * - **`setActiveDataset(state)` removed -- 450 records, i.e. all of them.** The
+ *   parameter is gone, so the count that only ever meant "states installed
+ *   without the chokepoint seeing them" has nothing left to count and is no
+ *   longer emitted. `setActiveDataset` itself is unchanged at 1 everywhere the
+ *   ladder installs a dataset, which is the check the update convention names:
+ *   the door closing must not look like the dataset ceasing to be installed.
+ * - **`setState` added -- 90 records: the `config.locus` door, both columns.**
+ *   45 browser configs x 2 viewports x 1 door. That door used to install
+ *   `State.default()` through the back door and go straight on to
+ *   `parseGotoInput`; it now hands the default to the chokepoint first. The
+ *   `config.synchState` door is the other rung #558 could not reach, and it
+ *   does not appear here because it is still unreachable (#566) and still
+ *   recording the fallback.
+ *
+ * **No `state` moved, and that is the expected shape rather than a null
+ * result.** The three doors that already called `setState` were handing it the
+ * same state before and after. On the `config.locus` door the validated default
+ * is overwritten a line later by `parseGotoInput`, so what the chokepoint now
+ * produces there is not what the record shows -- the door's value is that the
+ * raw state no longer *stands*, which is a claim about the state between two
+ * calls and therefore not a claim a snapshot can make.
+ * `test/testRestoreBackDoor.js` makes it, by trapping the field.
+ *
+ * ### The #561 tally
+ *
+ * **48 records of 450 moved, and only the `normalization` field moved** -- not
+ * one of the canonical six, in either column, on any door. Every movement is
+ * from a named normalization to `NONE`:
+ *
+ * - **The `config.state` door -- 24 records, 12 browser configs x 2 columns.**
+ *   These are the fixtures whose saved state carries a normalization at all;
+ *   the rest of the corpus already read `NONE` and had nothing to coerce.
+ * - **The live door -- 24 records, the same 12 configs x 2 columns.**
+ *   `loadLiveContactMap` decodes the same `config.state` and calls the same
+ *   chokepoint, so it inherits the coercion without being touched. That it moved
+ *   in step with the file path is the answer to #504's lesson: the two doors
+ *   agree here, which is exactly what the live column exists to show.
+ * - **Both columns moved by the same amount, and that is the point.** A clamp
+ *   moves one viewport column and not the other (the #558 tally above); a
+ *   normalization is not a function of the viewport, so a movement that
+ *   *differed* between the columns would be the bug report. Symmetry is the
+ *   evidence here, where asymmetry was the evidence there.
+ * - **Nothing moved on the `config.locus`, `config.synchState` or
+ *   `State.default()` doors.** All three hand the chokepoint a state whose
+ *   normalization is already `NONE`, which short-circuits ahead of the dataset.
+ *
+ * The dataset behind every record is `test/utils/restoreDataset.js`, which
+ * carries no `getNormalizationOptions` -- so `browser.getNormalizationOptions`
+ * takes its `['NONE']` fallback and every named normalization in the corpus is
+ * unavailable. That makes this column of the gate blind to the *preserving*
+ * half of the rule: it can show a coercion happening but not a valid
+ * normalization surviving one. `test/testRestoreNormalization.js` is where that
+ * half is pinned, against a dataset that answers with a real set.
+ *
+ * `harvested-external-state-numeric-normalization` is the fixture worth reading
+ * twice: its saved normalization is the string `"2000"`, a legacy nine-token
+ * state whose sixth field was never a normalization name. It used to be carried
+ * into the render path verbatim; it now resolves to `NONE`, which is what it
+ * always drew.
+ *
+ * Nothing was rejected -- every record still reads `"outcome": "restores"`.
+ * Coerced, never refused (ADR-0009 decisions 2 and 5).
+ *
+ * ### The #566 tally
+ *
+ * **92 records left the file and none of the remaining 368 moved.** The
+ * `config.synchState` column is gone -- 46 browser configs x 2 viewports x 1
+ * door -- because the rung it drove is gone. That is the whole of the diff, and
+ * it is the one shape the update convention says to look for: a column removed
+ * on purpose, and every surviving byte identical, which is what "deleting an
+ * unreachable rung changes nothing reachable" looks like in a snapshot. The
+ * column had recorded the fallback for every fixture in any case, so nothing
+ * that was ever observed there stopped being observed -- the fallback door is
+ * still driven, still per fixture, still in both columns.
+ *
+ * The historical tallies above still name the door; they are the record of what
+ * those tickets moved when it existed, and are left as they were written.
+ *
+ * ### The #567 tally
+ *
+ * **92 records of 368 moved -- the live door, every fixture, both columns --
+ * and nothing on the other three doors.** One cause, seen two ways:
+ *
+ * - **The origin -- 92 records.** `x` and `y` go from `-0.00004` (square) and
+ *   `-0.00002` (wide) to `0`, and each `locus` goes from `chr1:-1-...` to
+ *   `chr1:0-...`. The end of the wide column's x locus loses its overhang too,
+ *   `40000003` to `40000000`, because the origin it projects from is now whole.
+ * - **The fit -- the same records' `pixelSize`, and `zoom` in the wide column.**
+ *   The extent `parseGotoInput` was handed was `10000001` bp, one more than the
+ *   declared 10 Mb, so it never divided evenly into the viewport: `pixelSize`
+ *   was `1.99999980000002` in both columns, and at 400px tall the wide column
+ *   could not fit 400 bins of 25 kb and dropped to zoom 5. The extent is now
+ *   exactly 10 Mb, so the square column reads `pixelSize: 2` at the same zoom
+ *   and the wide one reads zoom 6 at `pixelSize: 1`.
+ *
+ * Neither is a clamp, and the symmetry is how to tell: the origin moved in both
+ * columns, which the update convention reads as a change to what the door is
+ * handed rather than to the clamp -- here a door's own input corrected, the
+ * movement class listed above. `rungs`, `normalization`, `chr1`, `chr2` and
+ * `outcome` did not move anywhere. The live door's `state` rung is still
+ * overwritten by `parseGotoInput` (#650), and `updateWithLoci` still does not
+ * clamp (#649). `test/testLiveDoorOrigin.js` asserts the non-negative origin by
+ * name.
+ *
+ * @see docs/adr/0009-restore-is-a-translator.md — the decisions this gate guards
+ * @see test/data/wireFormatCorpus.js — the inputs
+ * @see test/testDecoderGolden.js, test/testConfigGolden.js — the same instrument, one seam either side
+ */
+import {beforeEach, describe, expect, test, vi} from 'vitest'
+import {igvxhr} from 'igv-utils'
+import {extractConfig} from '../js/urlUtils.js'
+import {decodeState} from '../js/sessionCodec.js'
+import {normalizeSession} from '../js/normalizeSession.js'
+import {selfContained, viaLoader, wireFormatCorpus} from './data/wireFormatCorpus.js'
+import {restoreDataset} from './utils/restoreDataset.js'
+import {restoreFixture} from './utils/restoreFixture.js'
+
+/**
+ * The two things behind the restore path that a test cannot supply: the `.hic`
+ * read and, on the live door, the streaming source. Both answer with the same
+ * `restoreDataset`, so the two doors land on identical chromosome tables and
+ * resolution ladders and any difference between their columns is the ladder's,
+ * not the dataset's.
+ *
+ * `vi.mock` rather than `vi.spyOn` because the live door reaches its dataset
+ * through `new HiCDataset(...)`, and a constructor cannot be spied.
+ */
+vi.mock('../js/hicDataset.js', async () => {
+    const {restoreDataset, datasetModule} = await import('./utils/restoreDataset.js')
+    return datasetModule(restoreDataset)
+})
+
+const {default: HICBrowser} = await import('../js/hicBrowser.js')
+
+/**
+ * The stated viewports.
+ *
+ * `800 x 800` is the size `test/testState.js` already states, for the same
+ * reason and against the same `--hic-viewport-width/height` the browser writes
+ * onto `rootElement` in a real page. `1600 x 400` differs on both axes and
+ * inverts the aspect, so a clamp that binds on x and not on y is visible as a
+ * difference between the columns rather than as a single number nobody can
+ * calibrate.
+ */
+const VIEWPORTS = [
+    {id: '800x800', width: 800, height: 800},
+    {id: '1600x400', width: 1600, height: 400},
+]
+
+/**
+ * The viewport the `locus` door's input is derived at -- see `LOCUS_DOOR`.
+ * Fixed rather than per-column so that the *same* locus string is presented at
+ * both viewports and the difference between the columns is restore's doing
+ * rather than the input's.
+ */
+const REFERENCE_VIEWPORT = VIEWPORTS[0]
+
+/**
+ * The extent a live contact map declares. Stated, like the viewports, because a
+ * live map has no file to be measured against -- and stated small enough to sit
+ * well inside chr1, so that the live door's unconditional `parseGotoInput` lands
+ * on a real region rather than on a whole chromosome.
+ */
+const LIVE_EXTENT = {genomicStart: 0, genomicEnd: 10000000}
+
+function formatLocus(locus) {
+    return `${locus.x.chr}:${locus.x.start}-${locus.x.end} ${locus.y.chr}:${locus.y.start}-${locus.y.end}`
+}
+
+/**
+ * The config a door was handed, rendered *before* the load runs.
+ *
+ * Before, because `loadHicFile` writes to the object it is given -- `config.name`
+ * from `extractName`, `config.nvi` from the lookup table in `js/nvi.js` -- and a
+ * record taken afterwards would be showing the load's output in the input
+ * column.
+ *
+ * Two shapes get special treatment. A `state` keeps its class, because the query
+ * decoder hands over a `State` and session JSON a plain object, and those take
+ * different halves of `decodeState`; erasing the difference would erase the one
+ * thing the two spellings disagree about. A `liveContactMap` is elided down to
+ * its extent, because the rest of it is the `restoreDataset` chromosome table --
+ * twenty-five entries of hg19 that would be repeated in every live-door record
+ * in the file and say nothing.
+ */
+function renderPresented(config) {
+
+    const rendered = {url: config.url}
+
+    if ('locus' in config) {
+        rendered.locus = config.locus
+    }
+
+    if ('state' in config) {
+        rendered.state = renderPresentedState(config.state)
+    }
+
+    if ('liveContactMap' in config) {
+        const {chromosomes, ...extent} = config.liveContactMap
+        rendered.liveContactMap = {chromosomes: `${chromosomes.length} — the restoreDataset table`, ...extent}
+    }
+
+    return rendered
+}
+
+function renderPresentedState(state) {
+
+    if (state === undefined || state === null || typeof state !== 'object') {
+        return state
+    }
+
+    const fields = Object.fromEntries(Object.keys(state).sort().map(key => [key, state[key]]))
+    const className = state.constructor?.name
+
+    return className === undefined || className === 'Object' ? fields : {__class: className, ...fields}
+}
+
+/**
+ * A `State` as plain, order-stable data, plus the BP projection of it at the
+ * viewport it was resolved against.
+ *
+ * The projection is included because the six canonical fields are bins and a bin
+ * is unreadable without its resolution: `x: 5537.98` says nothing about whether
+ * a clamp bit, and `chr3:13844968-...` says it immediately. It is a pure
+ * function of the fields above it, so it never moves on its own -- a `locus`
+ * that moves without its `state` moving is a change to `getLocus`, which is not
+ * this candidate's.
+ */
+function renderState(state, dataset, viewport) {
+    if (state === undefined) {
+        return undefined
+    }
+    return {
+        __class: state.constructor?.name,
+        chr1: state.chr1,
+        chr2: state.chr2,
+        zoom: state.zoom,
+        x: state.x,
+        y: state.y,
+        pixelSize: state.pixelSize,
+        normalization: state.normalization,
+        locus: formatLocus(state.getLocus(dataset, viewport)),
+    }
+}
+
+/**
+ * The four doors, each with the spelling of the view it accepts.
+ *
+ * `present` receives the state the fixture's config decodes to -- `decodeState`
+ * is the ladder's own `state` rung, so the intent is the view the fixture
+ * *means*, whether it spelled it as a `state=` token, as session JSON, or not at
+ * all (in which case the intent is the default view and every door is still
+ * asked). Returning the fixture's own material rather than a literal is what
+ * keeps the columns comparable: four spellings, one view.
+ */
+const RESTORE_DOORS = [
+    {
+        id: 'config.locus — the goto rung',
+        // A locus is BP and a state is bins, so the translation between them is
+        // a projection and needs a viewport. It is taken at REFERENCE_VIEWPORT
+        // rather than at the column's own, so both columns are handed the same
+        // string. That makes the square column a round trip and the wide one
+        // not, which is itself worth seeing: the wide column shows what a link
+        // built on one screen does on another.
+        present: (intent, dataset) => ({
+            locus: formatLocus(intent.getLocus(dataset, REFERENCE_VIEWPORT)),
+        }),
+    },
+    {
+        id: 'config.state — the restore rung',
+        // The wire spelling as it arrived, not the decoded State: a fixture
+        // whose `state` is a token string and one whose `state` is session JSON
+        // take different halves of `decodeState`, and handing the door a
+        // pre-decoded object would erase that.
+        present: (intent, dataset, browserConfig) => ({state: browserConfig.state}),
+    },
+    {
+        id: 'State.default() — the fallback rung',
+        // Nothing presented. The column is the same for every fixture by
+        // construction, and it is snapshotted per fixture anyway: "the fallback
+        // does not depend on the config" is a claim #510 found to be false in a
+        // different way, and a column that is identical everywhere is the cheapest
+        // possible statement of it.
+        present: () => ({}),
+    },
+    {
+        id: 'loadLiveContactMap — the live door',
+        live: true,
+        present: (intent, dataset, browserConfig) => ({
+            state: browserConfig.state,
+            liveContactMap: {chromosomes: dataset.chromosomes, ...LIVE_EXTENT},
+        }),
+    },
+]
+
+/**
+ * Which rungs ran, observed rather than inferred.
+ *
+ * Counted on the prototype, so a call from anywhere reaches it -- including the
+ * `syncState` the file door makes on its own behalf after the ladder, and the
+ * `parseGotoInput` the live door makes unconditionally after its `setState`.
+ * That second one is the whole reason this is a count and not a name.
+ */
+function rungCounter() {
+
+    const counts = {}
+
+    const count = (target, method, label = method) => {
+        const original = target[method]
+        vi.spyOn(target, method).mockImplementation(function (...args) {
+            counts[label] = (counts[label] || 0) + 1
+            return original.apply(this, args)
+        })
+    }
+
+    beforeEach(() => {
+        for (const method of ['parseGotoInput', 'setState', 'syncState']) {
+            count(HICBrowser.prototype, method)
+        }
+        // Not a rung: the back door beside the ladder. It took a second `state`
+        // parameter until #559, and this counted the calls that carried one --
+        // per door, the states a load installed without the chokepoint seeing
+        // them. The parameter is gone (ADR-0009 decision 1), so what is left to
+        // count is the dataset install itself, which the update convention reads
+        // alongside the state: a door losing this call while its state stays put
+        // would mean the dataset stopped being installed.
+        const original = HICBrowser.prototype.setActiveDataset
+        vi.spyOn(HICBrowser.prototype, 'setActiveDataset').mockImplementation(function (dataset) {
+            counts['setActiveDataset'] = (counts['setActiveDataset'] || 0) + 1
+            return original.call(this, dataset)
+        })
+    })
+
+    return {
+        take() {
+            const taken = {...counts}
+            for (const key of Object.keys(counts)) delete counts[key]
+            return taken
+        },
+    }
+}
+
+/**
+ * A JSDOM, the two stubs every restore needs, and the rung counter.
+ *
+ * The DOM and the stubs are `test/utils/restoreFixture.js`'s (#571), which is
+ * where the `update` stubs, the network tripwire and the composed
+ * `withContainers()` now live for all the restore suites. This file needs the
+ * `another()` container factory for the reason that helper exists -- one embed
+ * per drive -- and nothing else about the DOM. It does not navigate, because no
+ * door here reads `window.location`.
+ *
+ * The fixture's `embed()` is deliberately not used: it states one viewport, and
+ * here the viewport is the column, so `drive()` states its own per drive.
+ */
+function restoreSuite() {
+
+    const {dom} = restoreFixture(HICBrowser, {suite: 'restore golden-file'})
+
+    return {dom, rungs: rungCounter()}
+}
+
+/**
+ * Drive one door, in a browser of its own, at one stated viewport.
+ *
+ * A container per drive rather than per fixture: `loadHicFile` ends by syncing
+ * against every compatible browser in the same registry, so two doors sharing an
+ * embed would have the first one's state reach the second's -- which is a real
+ * behaviour with a suite of its own, and noise here.
+ */
+async function drive(door, dom, rungs, browserConfig, intent, viewport) {
+
+    const dataset = restoreDataset(browserConfig)
+    const presented = {url: browserConfig.url, ...door.present(intent, dataset, browserConfig)}
+    const record = {viewport: {width: viewport.width, height: viewport.height}, presented: renderPresented(presented)}
+
+    const browser = new HICBrowser(dom.another(), browserConfig)
+    vi.spyOn(browser.contactMatrixView, 'getViewDimensions').mockReturnValue({
+        width: viewport.width,
+        height: viewport.height,
+    })
+
+    rungs.take()
+
+    record.outcome = 'restores'
+    try {
+        if (door.live) {
+            await browser.loadLiveContactMap(presented, true)
+        } else {
+            await browser.loadHicFile(presented, true)
+        }
+    } catch (e) {
+        record.outcome = 'throws'
+        record.error = {name: e?.name, message: e?.message}
+    }
+
+    record.rungs = rungs.take()
+    record.state = renderState(browser.state, dataset, viewport)
+
+    return record
+}
+
+/**
+ * The corpus, decoded and normalized once, off its own string literals.
+ *
+ * The decode is #503's subject and the normalize is #531's; neither is being
+ * characterized here. They run because restore's input is what they produce, and
+ * driving them from the same literals is what makes a fixture added to #502
+ * appear on all three seams without being written down three times.
+ */
+async function browserConfigsFor(fixture) {
+
+    if (fixture.loaderResponse !== undefined) {
+        vi.spyOn(igvxhr, 'loadString').mockImplementation(async () => fixture.loaderResponse)
+    }
+
+    const decoded = await extractConfig(fixture.input)
+    const session = normalizeSession(decoded)
+    return session.browsers || [session]
+}
+
+const DECODING_FIXTURES = [...selfContained, ...viaLoader].filter(f => f.outcome === 'decodes')
+
+/**
+ * "Every door is covered" has to hold by construction rather than by having been
+ * true the day it was written -- the same guard #503 puts over its partitions and
+ * #531 over its entry paths. The one failure mode a golden file cannot survive is
+ * a case that stops being snapshotted in silence, and for this file that case is
+ * the door nobody is touching: #504's live path is in the table precisely because
+ * it drifted while nothing watched it.
+ */
+test('all four restore doors are driven, and exactly one of them is the live path', () => {
+
+    expect(RESTORE_DOORS.map(door => door.id)).toEqual([
+        'config.locus — the goto rung',
+        'config.state — the restore rung',
+        'State.default() — the fallback rung',
+        'loadLiveContactMap — the live door',
+    ])
+
+    expect(RESTORE_DOORS.filter(door => door.live).map(door => door.id))
+        .toEqual(['loadLiveContactMap — the live door'])
+
+    expect(RESTORE_DOORS.every(door => typeof door.present === 'function')).toBe(true)
+})
+
+/**
+ * The viewports are the other thing that cannot be allowed to shrink in silence:
+ * a golden that quietly dropped to one column would still be green, and would
+ * have stopped measuring the only property candidate 6 is asserting.
+ */
+test('two viewports are stated, and they differ on both axes', () => {
+
+    expect(VIEWPORTS).toHaveLength(2)
+
+    const [square, wide] = VIEWPORTS
+    expect(square.width).not.toBe(wide.width)
+    expect(square.height).not.toBe(wide.height)
+    expect(square.width / square.height).not.toBe(wide.width / wide.height)
+
+    // Stated, never measured. `contactMatrixView.getViewDimensions()` reads
+    // `offsetWidth`/`offsetHeight`, which JSDOM answers with 0 -- ADR-0009 fact 5.
+    for (const viewport of VIEWPORTS) {
+        expect(Number.isFinite(viewport.width) && viewport.width > 0).toBe(true)
+        expect(Number.isFinite(viewport.height) && viewport.height > 0).toBe(true)
+    }
+})
+
+/**
+ * The corpus's other half has to be accounted for, not merely absent.
+ *
+ * `testDecoderGolden.js` guards this with a partition check, and the same
+ * failure mode applies here one seam down: a fixture that silently stops being
+ * driven leaves a green suite measuring less than it says. This file drives
+ * strictly fewer fixtures than that one, so it states which and why rather than
+ * letting the `filter` above be the only record.
+ *
+ * One exclusion, and it is structural: **`throws` and `no-config`** never
+ * produce a config, so there is no state for a restore door to resolve. #503 is
+ * where those outcomes are pinned.
+ *
+ * There was a second until #519 -- three `sessionFile` fixtures whose declared
+ * `outcome` said `decodes` but whose arm nothing could reach. The arm is gone
+ * and so are they, which is why the reason list below has one entry.
+ */
+test('every corpus fixture is either driven or excluded for a stated reason', () => {
+
+    const driven = new Set(DECODING_FIXTURES.map(fixture => fixture.id))
+    const excluded = wireFormatCorpus.filter(fixture => !driven.has(fixture.id))
+
+    expect(driven.size + excluded.length).toBe(wireFormatCorpus.length)
+    expect(driven.size).toBeGreaterThan(0)
+
+    for (const fixture of excluded) {
+        expect(['throws', 'no-config'], fixture.id).toContain(fixture.outcome)
+    }
+})
+
+describe('resolved state golden file — every restore door, at two stated viewports', () => {
+
+    const {dom, rungs} = restoreSuite()
+
+    for (const fixture of DECODING_FIXTURES) {
+        test(fixture.id, async () => {
+
+            const browserConfigs = await browserConfigsFor(fixture)
+
+            const byBrowser = []
+            for (const browserConfig of browserConfigs) {
+
+                const intent = decodeState(browserConfig.state)
+                const byDoor = {}
+
+                for (const door of RESTORE_DOORS) {
+                    const byViewport = {}
+                    for (const viewport of VIEWPORTS) {
+                        byViewport[viewport.id] = await drive(
+                            door, dom, rungs, browserConfig, intent, viewport,
+                        )
+                    }
+                    byDoor[door.id] = byViewport
+                }
+
+                byBrowser.push(byDoor)
+            }
+
+            expect(byBrowser).toMatchSnapshot()
+        })
+    }
+})

@@ -2,225 +2,179 @@
  * @author Jim Robinson Dec-2020
  */
 
-import {StringUtils} from '../node_modules/igv-utils/src/index.js'
-import $ from '../vendor/jquery-3.3.1.slim.js'
-import HICBrowser from './hicBrowser.js'
-import ColorScale from './colorScale.js'
-import State from './hicState.js'
-import ContactMatrixView from "./contactMatrixView.js"
-import HICEvent from "./hicEvent.js"
-import EventBus from "./eventBus.js"
+import HICBrowser from './hicBrowser.js';
+import {registryForContainer, getMostRecentlySelectedBrowser, currentRegistry} from './browserRegistry.js';
+import {normalizeSession} from './normalizeSession.js';
 
-const defaultSize = {width: 640, height: 640}
+const defaultSize = { width: 640, height: 640 };
 
-let allBrowsers = []
-let currentBrowser
+/**
+ * Module-level conveniences over the registries, kept and delegating per
+ * decision 4 of ADR-0004 -- both known host apps import them, as ADR-0003
+ * measures.
+ *
+ * There is no default registry: each function below resolves one, from its
+ * container argument, from `browser.registry`, or -- for the two zero-argument
+ * getters, which have nothing to resolve from -- from the browser most recently
+ * selected page-wide. See `js/browserRegistry.js` and decisions 2, 8 and 9 of
+ * `docs/adr/0004-browser-registry-per-container.md`.
+ */
 
-async function createBrowser(hic_container, config, callback) {
+/**
+ * The published single-browser door, and one of the two places a session is
+ * resolved. #535.
+ *
+ * The two lines below are the seam: **above it a config is decided, below it a
+ * config is read.** `buildBrowser` and `createBrowserList` are the below half --
+ * neither normalizes, because by the time either runs the document it is handed
+ * has been through the stage exactly once. The other door is
+ * `BrowserRegistry.restoreSession`, which every session-shaped entry reaches:
+ * `hic.init`, the query path it delegates to, and `hic.restoreSession`.
+ *
+ * ## Why the entry has two doors rather than one function
+ *
+ * Both are published surface (`js/publicApi.js`), so neither can be hidden
+ * behind the other, and they take different shapes: a session for the restore, a
+ * single browser config here. Two calls, one stage, and no path reaching both --
+ * `createBrowser` adds a browser to a registry, it does not restore an embed.
+ */
+async function createBrowser(hicContainer, config, callback) {
 
-    const $hic_container = $(hic_container);
+    // A single browser config *is* a session with its one browser inlined, and
+    // that is what this hands over: the config's own members as the session's,
+    // and the config itself as the one browser. Session-level rules --
+    // `syncDatasets`, the selected gene -- therefore reach it here exactly as
+    // they reach a document naming `browsers`, which is the divergence #533
+    // closed at this door.
+    //
+    // Spread rather than handed over as it is, because `browsers` is overwritten
+    // in the copy: a `browsers` member on a single browser config is an ordinary
+    // unread member, and letting it steer the stage would leave the object that
+    // actually becomes `browser.config` undefaulted. The copy is discarded;
+    // `config` is what is normalized. See js/normalizeSession.js.
+    //
+    // So a session-level rule that writes *down* onto the browsers reaches
+    // `config` -- `syncDatasets` does -- and one that writes *up* onto the
+    // session lands on the discarded copy. Only the selected-gene hoist writes
+    // up, and this door has no registry to give it to: it is
+    // `BrowserRegistry.restoreSession` that owns the gene. Nothing is lost here
+    // that anything reads.
+    normalizeSession({...config, browsers: [config]});
 
-    setDefaults(config);
+    return buildBrowser(hicContainer, config, callback);
+}
 
-    if (StringUtils.isString(config.state)) {
-        config.state = State.parse(config.state);
-    }
-    if (StringUtils.isString(config.colorScale)) {
-        config.colorScale = ColorScale.parse(config.colorScale);
-    }
-    if (StringUtils.isString(config.backgroundColor)) {
-        config.backgroundColor = ContactMatrixView.parseBackgroundColor(config.backgroundColor);
-    }
+/**
+ * Build one browser from a config that has already been resolved, and register
+ * it. Below the seam: it reads the config, it does not decide it.
+ *
+ * `createBrowserList` does not call this, and the near-repetition is deliberate:
+ * it registers each browser *before* initializing it, because loading a dataset
+ * consults the registry, and it initializes the whole list in parallel. This one
+ * adds an initialized browser to a registry that already has browsers in it.
+ * Folding them together would mean parameterizing the order of two calls, which
+ * is how a two-line difference becomes a flag.
+ */
+async function buildBrowser(hicContainer, config, callback) {
 
-    const browser = new HICBrowser($hic_container, config);
+    const browser = new HICBrowser(hicContainer, config);
     await browser.init(config);
-    if (typeof callback === "function") {
-        callback();
-    }
 
-    allBrowsers.push(browser);
-    setCurrentBrowser(browser);
-    if (allBrowsers.length > 1) {
-        allBrowsers.forEach(function (b) {
-            b.$browser_panel_delete_button.show();
-        });
-    }
+    if (typeof callback === "function") callback();
+
+    registryForContainer(hicContainer).add(browser);
 
     return browser;
 }
 
 /**
- * Create multiple browsers, maintaining order specified in configList.  Called from restore session
+ * Build an embed's browsers from a session that has already been resolved.
  *
- * @param hic_container
- * @param configList
+ * Below the seam, and internal: this is not exported from `js/index.js`, and its
+ * one caller is `BrowserRegistry.restoreSession`, which is where the session
+ * this walks was normalized. It used to normalize too -- a second call over a
+ * document the restore had already resolved, harmless only because the stage is
+ * idempotent -- and #535 is the ticket that removed it. What is left is a loop
+ * that reads `browsers || [session]` and nothing that interprets a field.
  */
-async function createBrowserList(hic_container, session) {
+async function createBrowserList(hicContainer, session) {
 
-    const $hic_container = $(hic_container);
+    const registry = registryForContainer(hicContainer);
+
     const configList = session.browsers || [session];
-
-
-    allBrowsers = [];
     const initPromises = [];
-    for (let config of configList) {
-        setDefaults(config);
-        if (StringUtils.isString(config.state)) {
-            config.state = State.parse(config.state);
-        }
-        if (StringUtils.isString(config.colorScale)) {
-            config.colorScale = ColorScale.parse(config.colorScale);
-        }
-        if (StringUtils.isString(config.backgroundColor)) {
-            config.backgroundColor = ContactMatrixView.parseBackgroundColor(config.backgroundColor);
-        }
-        if(false === session.syncDatasets) {
-            config.synchable = false;
-        }
 
-        const browser = new HICBrowser($hic_container, config);
+    registry.clear();
 
-        allBrowsers.push(browser);
+    for (const config of configList) {
+
+        const browser = new HICBrowser(hicContainer, config);
+
+        // Registered before init: loading a dataset consults the registry.
+        registry.register(browser);
         initPromises.push(browser.init(config));
     }
     await Promise.all(initPromises);
 
-    setCurrentBrowser(allBrowsers[0]);
-
-    if (allBrowsers.length > 1) {
-        allBrowsers.forEach(function (b) {
-            b.$browser_panel_delete_button.show();
-        });
-    }
+    registry.select(registry.browsers[0]);
+    registry.refreshDeleteButtonVisibility();
 }
 
-async function updateAllBrowsers() {
-    for (let b of allBrowsers) {
-        await b.update()
-    }
+function deleteAllBrowsers(hicContainer) {
+    registryForContainer(hicContainer).deleteAll();
 }
 
-function deleteAllBrowsers() {
-    for (let b of allBrowsers) {
-        b.$root.remove();
-    }
-    allBrowsers = [];
-}
+/**
+ * Select `browser` in its own registry, or -- given `undefined` -- clear the
+ * selection of whichever registry currently holds it.
+ *
+ * The `undefined` case is the one call that has no back-pointer to resolve
+ * through, and it predates the registries: `select` has always accepted it. So
+ * it falls back to the page-wide pointer, which in the single-embed case names
+ * the same registry a browser argument would have.
+ */
+function setCurrentBrowser(browser) {
 
-function setCurrentBrowser(browser) {// unselect current browser
     if (undefined === browser) {
-        if (currentBrowser) {
-            currentBrowser.$root.removeClass('hic-root-selected');
-        }
-        currentBrowser = browser;
+        currentRegistry()?.select(undefined);
         return;
     }
-    if (browser !== currentBrowser) {
-        if (currentBrowser) {
-            currentBrowser.$root.removeClass('hic-root-selected');
-        }
-        browser.$root.addClass('hic-root-selected');
-        currentBrowser = browser;
-        EventBus.globalBus.post(HICEvent("BrowserSelect", browser))
-    }
-}
 
+    browser.registry.select(browser);
+}
 
 function deleteBrowser(browser) {
-    browser.unsyncSelf();
-    browser.$root.remove();
-    allBrowsers = allBrowsers.filter(b => b != browser);
-    if (allBrowsers.length <= 1) {
-        allBrowsers.forEach(function (b) {
-            b.$browser_panel_delete_button.hide();
-        });
-    }
+    browser.registry.delete(browser);
 }
 
+/**
+ * The browser most recently selected, anywhere on the page.
+ *
+ * A single-embed convenience: with two embeds it names whichever one the user
+ * touched last, which is rarely what a caller holding a particular container
+ * means. Multi-embed callers should reach the registry -- `browser.registry`,
+ * or `registryForContainer(container)` -- instead of asking page-wide.
+ */
 function getCurrentBrowser() {
-    return currentBrowser;
+    return getMostRecentlySelectedBrowser();
 }
 
-function syncBrowsers(browsers) {
-
-    const synchableBrowsers = (browsers || allBrowsers).filter(b => (false !== b.synchable) && (b.dataset !== undefined));
-
-    // Sync compatible maps only
-    for (let b1 of synchableBrowsers) {
-        for (let b2 of synchableBrowsers) {
-            if (b1 === b2) continue;
-            if (b1.dataset.isCompatible(b2.dataset)) {
-                b1.synchedBrowsers.push(b2);
-                b2.synchedBrowsers.push(b1);
-            }
-        }
-    }
-}
-
+/**
+ * The browsers of the registry owning the current browser, and `[]` before
+ * anything has been selected.
+ *
+ * The same single-embed convenience as `getCurrentBrowser`, and inherits its
+ * caveat: which embed's list this is follows the page-wide selection. A
+ * multi-embed caller wants `registryForContainer(container).browsers`.
+ *
+ * The empty case is reachable mid-initialization as well as before it:
+ * `createBrowserList` registers every browser and only selects once they have
+ * all initialized, so a caller reading this from inside a load sees `[]`. That
+ * is the other reason to hold a registry rather than ask page-wide.
+ */
 function getAllBrowsers() {
-    return allBrowsers;
+    return currentRegistry()?.browsers || [];
 }
-
-
-// Set default values for config properties
-function setDefaults(config) {
-
-    if (config.state) {
-
-        if (StringUtils.isString(config.state)) {
-            config.state = State.parse(config.state)
-        } else {
-            // copy
-            config.state = new State(
-                config.state.chr1,
-                config.state.chr2,
-                config.state.zoom,
-                config.state.x,
-                config.state.y,
-                config.width,
-                config.height,
-                config.state.pixelSize,
-                config.state.normalization)
-        }
-    }
-
-    if (config.figureMode === true) {
-        config.showLocusGoto = false;
-        config.showHicContactMapLabel = false;
-        config.showChromosomeSelector = false;
-    } else {
-        if (undefined === config.width) {
-            config.width = config.state ? config.state.width : defaultSize.width
-        }
-        if (undefined === config.height) {
-            config.height = config.state ? config.state.height : defaultSize.height
-        }
-        if (undefined === config.showLocusGoto) {
-            config.showLocusGoto = true;
-        }
-        if (undefined === config.showHicContactMapLabel) {
-            config.showHicContactMapLabel = true;
-        }
-        if (undefined === config.showChromosomeSelector) {
-            config.showChromosomeSelector = true
-        }
-    }
-
-}
-
-
-// mock igv browser objects for igv.js compatibility
-// function createIGV($hic_container, hicBrowser) {
-//
-//     igv.browser =
-//         {
-//             constants: {defaultColor: "rgb(0,0,150)"},
-//
-//             // Compatibility wit igv menus
-//             trackContainerDiv: hicBrowser.layoutController.$x_track_container.get(0)
-//         };
-//     igv.popover = new Popover($hic_container.get(0), igv.browser);
-// }
 
 export {
     defaultSize,
@@ -229,7 +183,6 @@ export {
     deleteBrowser,
     setCurrentBrowser,
     getCurrentBrowser,
-    syncBrowsers,
     deleteAllBrowsers,
     getAllBrowsers
-}
+};

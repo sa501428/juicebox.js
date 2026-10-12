@@ -24,123 +24,117 @@
 /**
  * Created by dat on 3/4/17.
  */
-import $ from '../vendor/jquery-3.3.1.slim.js'
-import {StringUtils} from '../node_modules/igv-utils/src/index.js'
+import { StringUtils } from 'igv-utils';
 
 class ResolutionSelector {
 
-    constructor(browser, $hic_navbar_container) {
-
+    constructor(browser, hicNavbarContainer) {
         this.browser = browser;
 
-        const $parent = $hic_navbar_container.find("div[id$='upper-hic-nav-bar-widget-container']");
+        const parentElement = hicNavbarContainer.querySelector("div[id$='upper-hic-nav-bar-widget-container']");
 
-        this.$container = $("<div>", {class: 'hic-resolution-selector-container', title: 'Resolution'});
-        $parent.append(this.$container);
+        this.containerElement = document.createElement('div');
+        this.containerElement.className = 'hic-resolution-selector-container';
+        this.containerElement.title = 'Resolution';
+        parentElement.appendChild(this.containerElement);
 
         // label container
-        this.$label_container = $('<div id="hic-resolution-label-container">');
-        this.$container.append(this.$label_container);
+        this.labelContainerElement = document.createElement('div');
+        this.labelContainerElement.id = 'hic-resolution-label-container';
+        this.containerElement.appendChild(this.labelContainerElement);
 
         // Resolution (kb)
-        this.$label = $("<div>");
-        this.$label_container.append(this.$label);
-        this.$label.text('Resolution (kb)');
-        this.$label.hide();
+        this.labelElement = document.createElement('div');
+        this.labelElement.textContent = 'Resolution (kb)';
+        this.labelElement.style.display = 'none';
+        this.labelContainerElement.appendChild(this.labelElement);
 
         // lock/unlock
-        this.$resolution_lock = $('<i id="hic-resolution-lock" class="fa fa-unlock" aria-hidden="true">');
-        this.$label_container.append(this.$resolution_lock);
-        this.$label_container.on('click', () => {
-            this.browser.resolutionLocked = !(this.browser.resolutionLocked);
-            this.setResolutionLock(this.browser.resolutionLocked);
+        this.resolutionLockElement = document.createElement('i');
+        this.resolutionLockElement.id = 'hic-resolution-lock';
+        this.resolutionLockElement.className = 'fa fa-unlock';
+        this.resolutionLockElement.setAttribute('aria-hidden', 'true');
+        this.labelContainerElement.appendChild(this.resolutionLockElement);
+        // The only writer that mirrors. `setResolutionLocked` repaints this
+        // padlock on the way through, so there is no `setResolutionLock` call
+        // here -- and the peers get theirs the same way. ADR-0014.
+        this.labelContainerElement.addEventListener('click', () => {
+            this.browser.setResolutionLocked(!this.browser.resolutionLocked, {mirror: true});
         });
 
-        this.$resolution_selector = $('<select name="select">');
-        this.$container.append(this.$resolution_selector);
+        this.resolutionSelectorElement = document.createElement('select');
+        this.resolutionSelectorElement.name = 'resolution_selector';
+        this.containerElement.appendChild(this.resolutionSelectorElement);
 
-        this.$resolution_selector.attr('name', 'resolution_selector');
-
-        this.$resolution_selector.on('change', () => {
-            const zoomIndex = parseInt(this.$resolution_selector.val());
+        this.resolutionSelectorElement.addEventListener('change', () => {
+            const zoomIndex = parseInt(this.resolutionSelectorElement.value);
             this.browser.setZoom(zoomIndex);
         });
 
-
-        this.browser.eventBus.subscribe("LocusChange", this);
-        this.browser.eventBus.subscribe("MapLoad", this);
-        this.browser.eventBus.subscribe("ControlMapLoad", this);
+        // Note: MapLoad, ControlMapLoad, and LocusChange subscriptions removed - now handled by BrowserCoordinator
+        // These components are updated directly via coordinator methods
     }
 
     setResolutionLock(resolutionLocked) {
-        this.$resolution_lock.removeClass((true === resolutionLocked) ? 'fa-unlock' : 'fa-lock');
-        this.$resolution_lock.addClass((true === resolutionLocked) ? 'fa-lock' : 'fa-unlock');
+        this.resolutionLockElement.classList.remove(resolutionLocked ? 'fa-unlock' : 'fa-lock');
+        this.resolutionLockElement.classList.add(resolutionLocked ? 'fa-lock' : 'fa-unlock');
     }
 
-    receiveEvent(event) {
 
+    async updateResolutions(zoomIndex) {
         const browser = this.browser;
+        const resolutions = browser.isWholeGenome() ?
+            [{ index: 0, binSize: browser.dataset.wholeGenomeResolution }] :
+            browser.getResolutions();
+        this.resolutionSelectorElement.innerHTML = '';
 
-        if (event.type === "LocusChange") {
-            if (true === event.data.resolutionChanged) {
-                browser.resolutionLocked = false;
-                this.setResolutionLock(browser.resolutionLocked);
-            }
-
-            if (event.data.chrChanged !== false) {  // Default true
-                const isWholeGenome = browser.dataset.isWholeGenome(event.data.state.chr1);
-                this.$label.text(isWholeGenome ? 'Resolution (mb)' : 'Resolution (kb)');
-                updateResolutions.call(this, browser.state.zoom);
+        resolutions.forEach(resolution => {
+            const binSize = resolution.binSize;
+            const index = resolution.index;
+            let divisor, unit;
+            if (binSize >= 1e6) {
+                divisor = 1e6;
+                unit = 'mb';
+            } else if (binSize >= 1e3) {
+                divisor = 1e3;
+                unit = 'kb';
             } else {
-                const selectedIndex = browser.state.zoom;
-                this.$resolution_selector
-                    .find('option')
-                    .filter(function (index) {
-                        return index === selectedIndex;
-                    })
-                    .prop('selected', true);
+                divisor = 1;
+                unit = 'bp';
             }
 
-        } else if (event.type === "MapLoad") {
-            browser.resolutionLocked = false;
-            this.setResolutionLock(false);
-            updateResolutions.call(this, browser.state.zoom);
-        } else if (event.type === "ControlMapLoad") {
-            updateResolutions.call(this, browser.state.zoom)
+            const pretty = `${StringUtils.numberFormatter(Math.round(binSize / divisor))} ${unit}`;
+            const option = document.createElement('option');
+            option.dataset.resolution = binSize;
+            option.value = index;
+            option.textContent = pretty;
+            if (zoomIndex === index) option.selected = true;
+            this.resolutionSelectorElement.appendChild(option);
+        });
+    }
+
+    /**
+     * Update the label text based on whether we're in whole-genome view.
+     * @param {boolean} isWholeGenome - True if in whole-genome view
+     */
+    updateLabelForWholeGenome(isWholeGenome) {
+        if (this.labelElement) {
+            this.labelElement.textContent = isWholeGenome ? 'Resolution (mb)' : 'Resolution (kb)';
         }
+    }
 
-        async function updateResolutions(zoomIndex) {
-
-            const resolutions = browser.isWholeGenome() ?
-                [{index: 0, binSize: browser.dataset.wholeGenomeResolution}] :
-                browser.getResolutions();
-            let htmlString = '';
-            for (let resolution of resolutions) {
-                const binSize = resolution.binSize;
-                const index = resolution.index;
-                let divisor;
-                let unit;
-                if (binSize >= 1e6) {
-                    divisor = 1e6
-                    unit = 'mb'
-                } else if (binSize >= 1e3) {
-                    divisor = 1e3
-                    unit = 'kb'
-                } else {
-                    divisor = 1
-                    unit = 'bp'
-                }
-                const pretty = StringUtils.numberFormatter(Math.round(binSize / divisor)) + ' ' + unit;
-                const selected = zoomIndex === resolution.index;
-                htmlString += '<option' + ' data-resolution=' + binSize.toString() + ' value=' + index + (selected ? ' selected' : '') + '>' + pretty + '</option>';
-
-            }
-            this.$resolution_selector.empty();
-            this.$resolution_selector.append(htmlString);
-        }
-
-
+    /**
+     * Set the selected resolution by zoom index.
+     * @param {number} zoomIndex - The zoom index to select
+     */
+    setSelectedResolution(zoomIndex) {
+        // Matched on the option's value, which is the zoom index. Its position
+        // in the list is a different number whenever a rung has been filtered
+        // out (an A/B map) or synthesised in (the sentinel rung, ADR-0010).
+        Array.from(this.resolutionSelectorElement.options).forEach(option => {
+            option.selected = parseInt(option.value, 10) === zoomIndex;
+        });
     }
 }
 
-export default ResolutionSelector
+export default ResolutionSelector;

@@ -25,72 +25,119 @@
  * @author Jim Robinson
  */
 
-import $ from '../vendor/jquery-3.3.1.slim.js'
-import {IGVColor} from '../node_modules/igv-utils/src/index.js'
-import ColorScale from './colorScale.js'
+import {IGVColor} from 'igv-utils'
 import HICEvent from './hicEvent.js'
 import * as hicUtils from './hicUtils.js'
+import {getLocus} from "./genomicUtils.js"
+import {getOffset} from "./utils.js"
+import GestureRecognizer from "./gestureRecognizer.js"
 
-const DRAG_THRESHOLD = 2;
-const DOUBLE_TAP_DIST_THRESHOLD = 20;
-const DOUBLE_TAP_TIME_THRESHOLD = 300;
-
-const imageTileDimension = 685;
+const doLegacyTrack2DRendering = false
 
 class ContactMatrixView {
 
-
-    constructor(browser, $viewport, sweepZoom, scrollbarWidget, colorScale, ratioColorScale, backgroundColor) {
-
-
+    /**
+     * The `backgroundColor` parameter default is this class answering for
+     * itself, and is deliberately *not* the kind of default #536 took out of the
+     * readers: it never sees a config. `normalizeSession` resolves
+     * `config.backgroundColor` for every browser and `createWidgets` passes what
+     * it finds there, so in a running juicebox this default is unreachable --
+     * it stands up a view constructed without a browser config behind it, which
+     * is what the suites that build a browser from `{}` do.
+     *
+     * A copy, because `defaultBackgroundColor` is a mutable object on the class
+     * and `setBackgroundColor` would otherwise let one view edit every other
+     * view's default. `normalizeSession.resolveBackgroundColor` copies it for the
+     * same reason.
+     */
+    constructor(browser, viewportElement, sweepZoom, scrollbarWidget, imageTileSource,
+                backgroundColor = {...ContactMatrixView.defaultBackgroundColor}) {
         this.browser = browser;
-        this.$viewport = $viewport;
+        this.viewportElement = viewportElement;
         this.sweepZoom = sweepZoom;
         this.scrollbarWidget = scrollbarWidget;
 
-        // Set initial color scales.  These might be overriden / adjusted via parameters
-        this.colorScale = colorScale;
-
-        this.ratioColorScale = ratioColorScale;
-        // this.diffColorScale = new RatioColorScale(100, false);
+        // Supplies the image tiles this view paints. Owns the color scales, the
+        // tile cache and rasterization. See CONTEXT.md.
+        this.imageTileSource = imageTileSource;
 
         this.backgroundColor = backgroundColor;
-        this.backgroundRGBString = IGVColor.rgbColor(backgroundColor.r, backgroundColor.g, backgroundColor.b)
+        this.backgroundRGBString = IGVColor.rgbColor(backgroundColor.r, backgroundColor.g, backgroundColor.b);
 
-        this.$canvas = $viewport.find('canvas');
-        this.ctx = this.$canvas.get(0).getContext('2d');
+        this.canvasElement = viewportElement.querySelector('canvas');
+        this.ctx = this.canvasElement.getContext('2d');
 
-        this.$fa_spinner = $viewport.find('.fa-spinner');
+        this.faSpinnerElement = viewportElement.querySelector('.fa-spinner');
         this.spinnerCount = 0;
 
-        this.$x_guide = $viewport.find("div[id$='-x-guide']");
-        this.$y_guide = $viewport.find("div[id$='-y-guide']");
+        this.xGuideElement = viewportElement.querySelector("div[id$='-x-guide']");
+        this.yGuideElement = viewportElement.querySelector("div[id$='-y-guide']");
 
         this.displayMode = 'A';
-        this.imageTileCache = {};
-        this.imageTileCacheKeys = [];
-        this.imageTileCacheLimit = 8; //8 is the minimum number required to support A/B cycling
-        this.colorScaleThresholdCache = {};
 
+        // Holds the in-progress gesture. This view only converts events to
+        // viewport pixels and carries out the intents it names. See CONTEXT.md.
+        this.gestureRecognizer = new GestureRecognizer();
 
-        this.browser.eventBus.subscribe("NormalizationChange", this);
-        this.browser.eventBus.subscribe("TrackLoad2D", this);
-        this.browser.eventBus.subscribe("TrackState2D", this);
-        this.browser.eventBus.subscribe("MapLoad", this)
-        this.browser.eventBus.subscribe("ControlMapLoad", this);
-        this.browser.eventBus.subscribe("ColorChange", this)
+        /**
+         * The handlers this view puts on `document`, so `dispose()` can take
+         * them off again.
+         *
+         * Everything else this view listens on lives inside the viewport and
+         * dies when `rootElement` is removed. Three modifier-key and mouse-up
+         * handlers do not: they are on `document` because a gesture that starts
+         * in the viewport can end outside it. Nothing removed them before, so a
+         * `reset()` -- which builds a second view over the same document --
+         * would post `DidHideCrosshairs` once per reset the browser had ever
+         * had. #494.
+         */
+        this.documentListeners = [];
+    }
 
-        this.drawsInProgress = new Set()
+    /**
+     * Listen on `document`, recording the registration for `dispose()`.
+     */
+    addDocumentListener(type, handler) {
+        document.addEventListener(type, handler);
+        this.documentListeners.push([type, handler]);
+    }
+
+    /**
+     * Give up what this view installed outside its own viewport.
+     *
+     * Called by `HICBrowser.dispose()`, which is the one teardown path -- and
+     * so also by `reset()`, which is that path followed by a reconstruction.
+     */
+    dispose() {
+        for (const [type, handler] of this.documentListeners) {
+            document.removeEventListener(type, handler);
+        }
+        this.documentListeners = [];
+    }
+
+    // The color scales live on the image tile source. These read-through
+    // accessors keep the existing call sites in hicBrowser, browserCoordinator
+    // and hicColorScaleWidget working unchanged.
+    get colorScale() {
+        return this.imageTileSource.colorScale;
+    }
+
+    get ratioColorScale() {
+        return this.imageTileSource.ratioColorScale;
+    }
+
+    get diffColorScale() {
+        return this.imageTileSource.diffColorScale;
     }
 
     setBackgroundColor(rgb) {
         this.backgroundColor = rgb
         this.backgroundRGBString = IGVColor.rgbColor(rgb.r, rgb.g, rgb.b)
-        this.repaint()
+        this.update()
     }
 
     stringifyBackgroundColor() {
-        return `${this.backgroundColor.r},${this.backgroundColor.g},${this.backgroundColor.b}`;
+        return `${this.backgroundColor.r},${this.backgroundColor.g},${this.backgroundColor.b}`
     }
 
     static parseBackgroundColor(rgbString) {
@@ -99,72 +146,55 @@ class ContactMatrixView {
     }
 
     setColorScale(colorScale) {
-
-        switch (this.displayMode) {
-            case 'AOB':
-            case 'BOA':
-                this.ratioColorScale = colorScale;
-                break;
-            case 'AMB':
-                this.diffColorScale = colorScale;
-                break;
-            default:
-                this.colorScale = colorScale;
-        }
-        this.colorScaleThresholdCache[colorScaleKey(this.browser.state, this.displayMode)] = colorScale.threshold;
+        this.imageTileSource.setColorScale(colorScale, this.displayMode, this.browser.state)
     }
 
     async setColorScaleThreshold(threshold) {
-        this.getColorScale().setThreshold(threshold);
-        this.colorScaleThresholdCache[colorScaleKey(this.browser.state, this.displayMode)] = threshold;
-        this.imageTileCache = {};
+        this.imageTileSource.setThreshold(threshold, this.displayMode, this.browser.state)
         await this.update()
     }
 
-    getColorScale() {
-        switch (this.displayMode) {
-            case 'AOB':
-            case 'BOA':
-                return this.ratioColorScale;
-            case 'AMB':
-                return this.diffColorScale;
-            default:
-                return this.colorScale;
-        }
+    /**
+     * The color scale a display mode renders with, defaulting to the mode on
+     * screen. Callers announcing a mode change pass the incoming mode, which is
+     * not yet the one this view has committed to.
+     */
+    getColorScale(displayMode = this.displayMode) {
+        return this.imageTileSource.getColorScale(displayMode)
     }
 
     async setDisplayMode(mode) {
-        this.displayMode = mode;
-        this.clearImageCaches();
-        await this.update();
+        this.displayMode = mode
+        this.clearImageCaches()
+        await this.update()
     }
 
-    clearImageCaches() {
-        this.imageTileCache = {};
-        this.imageTileCacheKeys = [];
+    /**
+     * @param {boolean} thresholds also discard computed color scale thresholds.
+     *        Map load passes true; a pan or color change does not.
+     */
+    clearImageCaches({thresholds = false} = {}) {
+        this.imageTileSource.invalidate({thresholds})
     }
 
     getViewDimensions() {
         return {
-            width: this.$viewport.width(),
-            height: this.$viewport.height()
-        }
+            width: this.viewportElement.offsetWidth,
+            height: this.viewportElement.offsetHeight
+        };
     }
 
     async receiveEvent(event) {
-
-        if ("MapLoad" === event.type || "ControlMapLoad" === event.type) {
-
+        if (event.type === "MapLoad" || event.type === "ControlMapLoad") {
             // Don't enable mouse actions until we have a dataset.
             if (!this.mouseHandlersEnabled) {
-                this.addTouchHandlers(this.$viewport);
-                this.addMouseHandlers(this.$viewport);
+                this.addTouchHandlers(this.viewportElement);
+                this.addMouseHandlers(this.viewportElement)
                 this.mouseHandlersEnabled = true;
             }
-            this.clearImageCaches();
-            this.colorScaleThresholdCache = {};
+            this.clearImageCaches({thresholds: true});
         } else {
-            if (!("LocusChange" === event.type)) {
+            if (event.type !== "LocusChange") {
                 this.clearImageCaches();
             }
             this.update();
@@ -177,452 +207,163 @@ class ContactMatrixView {
 
         await this.repaint()
 
+        if (this.browser.dataset && this.browser.state && false === doLegacyTrack2DRendering){
+            await this.render2DTracks(this.browser.tracks2D, this.browser.dataset, this.browser.state)
+        }
+
     }
 
     async repaint() {
+        if (!this.browser.dataset || !this.browser.state) return;
 
-        if (!this.browser.dataset) {
-            return;
-        }
+        const viewportWidth = this.viewportElement.offsetWidth;
+        const viewportHeight = this.viewportElement.offsetHeight;
+        const canvasWidth = this.canvasElement.width;
+        const canvasHeight = this.canvasElement.height;
 
-        const viewportWidth = this.$viewport.width()
-        const viewportHeight = this.$viewport.height()
-        const canvasWidth = this.$canvas.width()
-        const canvasHeight = this.$canvas.height()
         if (canvasWidth !== viewportWidth || canvasHeight !== viewportHeight) {
-            this.$canvas.width(viewportWidth);
-            this.$canvas.height(viewportHeight);
-            this.$canvas.attr('width', this.$viewport.width());
-            this.$canvas.attr('height', this.$viewport.height());
+            this.canvasElement.width = viewportWidth;
+            this.canvasElement.height = viewportHeight;
+            this.canvasElement.setAttribute('width', viewportWidth);
+            this.canvasElement.setAttribute('height', viewportHeight);
         }
 
-        const browser = this.browser;
-        const state = browser.state;
+        const {state, dataset, controlDataset} = this.browser;
 
-        let ds;
-        let dsControl;
-        let zdControl;
-        let zoom;
-        let controlZoom;
-        switch (this.displayMode) {
-            case 'A':
-                zoom = state.zoom;
-                ds = this.browser.dataset;
-                break;
-            case 'B':
-                zoom = getBZoomIndex(state.zoom);
-                ds = this.browser.controlDataset;
-                break;
-            case 'AOB':
-            case 'AMB':
-                zoom = state.zoom;
-                controlZoom = getBZoomIndex(state.zoom);
-                ds = this.browser.dataset
-                dsControl = this.browser.controlDataset
-                break;
-            case 'BOA':
-                zoom = getBZoomIndex(state.zoom);
-                controlZoom = state.zoom;
-                ds = this.browser.controlDataset
-                dsControl = this.browser.dataset
-        }
-
-        const matrix = await ds.getMatrix(state.chr1, state.chr2)
-        const unit = "BP";   // FRAG is not supported
-        const zd = matrix.getZoomDataByIndex(zoom, unit);
-
-        if (dsControl) {
-            const matrixControl = await dsControl.getMatrix(state.chr1, state.chr2)
-            zdControl = matrixControl.getZoomDataByIndex(controlZoom, unit);
-        }
-
-        const pixelSizeInt = Math.max(1, Math.floor(state.pixelSize))
-        const widthInBins = this.$viewport.width() / pixelSizeInt
-        const heightInBins = this.$viewport.height() / pixelSizeInt
-        const blockCol1 = Math.floor(state.x / imageTileDimension)
-        const blockCol2 = Math.floor((state.x + widthInBins) / imageTileDimension)
-        const blockRow1 = Math.floor(state.y / imageTileDimension)
-        const blockRow2 = Math.floor((state.y + heightInBins) / imageTileDimension)
-
-        if ("NONE" !== state.normalization) {
-            if (!ds.hasNormalizationVector(state.normalization, zd.chr1.name, zd.zoom.unit, zd.zoom.binSize)) {
-                Alert.presentAlert("Normalization option " + normalization + " unavailable at this resolution.");
-                this.browser.eventBus.post(new HICEvent("NormalizationExternalChange", "NONE"));
-                state.normalization = "NONE";
-            }
-        }
-
-        await this.checkColorScale(ds, zd, blockRow1, blockRow2, blockCol1, blockCol2, state.normalization)
-
-        this.ctx.clearRect(0, 0, viewportWidth, viewportHeight);
-        for (let r = blockRow1; r <= blockRow2; r++) {
-            for (let c = blockCol1; c <= blockCol2; c++) {
-                const tile = await this.getImageTile(ds, dsControl, zd, zdControl, r, c, state)
-                if (tile.image) {
-                    this.paintTile(tile)
-                }
-            }
-        }
-
-        // Record genomic extent of current canvas
-        this.genomicExtent = {
+        // Content is fixed for the pass; placement stays live, so tiles that
+        // resolve late during a pan land where the view is now rather than
+        // where it was when the pass started. See CONTEXT.md.
+        const snapshot = {
             chr1: state.chr1,
             chr2: state.chr2,
-            x: state.x * zd.zoom.binSize,
-            y: state.y * zd.zoom.binSize,
-            w: viewportWidth * zd.zoom.binSize / state.pixelSize,
-            h: viewportHeight * zd.zoom.binSize / state.pixelSize
-        }
+            x: state.x,
+            y: state.y,
+            zoom: state.zoom,
+            pixelSize: state.pixelSize,
+            normalization: state.normalization
+        };
 
-        function getBZoomIndex(zoom) {
-            const binSize = browser.dataset.getBinSizeForZoomIndex(zoom);
-            if (!binSize) {
-                throw Error("Invalid zoom (resolution) index: " + zoom);
+        const tiles = this.imageTileSource.tilesFor({
+            dataset,
+            controlDataset,
+            state: snapshot,
+            displayMode: this.displayMode,
+            viewDimensions: {width: viewportWidth, height: viewportHeight}
+        });
+
+        // Cleared on the first tile rather than up front: the source resolves
+        // matrices and may fetch for the color scale before yielding anything,
+        // and blanking the viewport for that window would flicker on every pass.
+        let cleared = false;
+        let binSize;
+
+        for await (const tile of tiles) {
+
+            // A pass can outlive the state it started from: reset() clears
+            // browser.state, and a subsequent load installs a different State
+            // object, while tiles are still resolving. Identity is the test —
+            // the chokepoint mutates in place, so pans keep the same object and
+            // placement stays live, while a clear or a bulk replacement swaps
+            // it and this pass has nothing left to place against (#469).
+            const liveState = this.browser.state;
+            if (liveState !== state) return;
+
+            if (!cleared) {
+                this.ctx.clearRect(0, 0, viewportWidth, viewportHeight);
+                cleared = true;
             }
-            const bZoom = browser.controlDataset.getZoomIndexForBinSize(binSize);
-            if (bZoom < 0) {
-                throw Error(`Invalid binSize for "B" map: ${binSize}`);
-            }
-            return bZoom;
-        }
-    }
 
-    /**
-     * This is where the image tile is actually drawn, if not in the cache
-     *
-     * @param ds
-     * @param dsControl
-     * @param zd
-     * @param zdControl
-     * @param row
-     * @param column
-     * @param state
-     * @returns {Promise<{image: HTMLCanvasElement, column: *, row: *, blockBinCount}|{image, inProgress: boolean, column: *, row: *, blockBinCount}|*>}
-     */
-    async getImageTile(ds, dsControl, zd, zdControl, row, column, state) {
+            binSize = tile.binSize;
 
-        const key = `${zd.chr1.name}_${zd.chr2.name}_${zd.zoom.binSize}_${zd.zoom.unit}_${row}_${column}_${state.normalization}_${this.displayMode}`
-
-        if (this.imageTileCache.hasOwnProperty(key)) {
-            return this.imageTileCache[key]
-
-        } else {
-            if (this.drawsInProgress.has(key)) {
-                //console.log("In progress")
-                const imageSize = imageTileDimension
-                const image = inProgressTile(imageSize)
-                return {
-                    row: row,
-                    column: column,
-                    blockBinCount: imageTileDimension,
-                    image: image,
-                    inProgress: true
-                }  // TODO return an image at a coarser resolution if avaliable
-
-            }
-            this.drawsInProgress.add(key)
-
-            try {
-                this.startSpinner()
-                const sameChr = zd.chr1.index === zd.chr2.index
-                const transpose = sameChr && row < column
-                const averageCount = zd.averageCount
-                const ctrlAverageCount = zdControl ? zdControl.averageCount : 1
-                const averageAcrossMapAndControl = (averageCount + ctrlAverageCount) / 2
-
-                const imageSize = imageTileDimension
-                const image = document.createElement('canvas');
-                image.width = imageSize;
-                image.height = imageSize;
-                const ctx = image.getContext('2d');
-                //ctx.clearRect(0, 0, image.width, image.height);
-
-                // Get blocks
-                const widthInBP = imageTileDimension * zd.zoom.binSize;
-                const x0bp = column * widthInBP;
-                const region1 = {chr: zd.chr1.name, start: x0bp, end: x0bp + widthInBP};
-                const y0bp = row * widthInBP;
-                const region2 = {chr: zd.chr2.name, start: y0bp, end: y0bp + widthInBP};
-                const records = await ds.getContactRecords(state.normalization, region1, region2, zd.zoom.unit, zd.zoom.binSize);
-                let cRecords;
-                if (zdControl) {
-                    cRecords = await dsControl.getContactRecords(state.normalization, region1, region2, zdControl.zoom.unit, zdControl.zoom.binSize);
-                }
-
-                if (records.length > 0) {
-
-                    const controlRecords = {};
-                    if ('AOB' === this.displayMode || 'BOA' === this.displayMode || 'AMB' === this.displayMode) {
-                        for (let record of cRecords) {
-                            controlRecords[record.getKey()] = record
-                        }
-                    }
-
-                    let id = ctx.getImageData(0, 0, image.width, image.height);
-
-
-                    const x0 = transpose ? row * imageTileDimension : column * imageTileDimension;
-                    const y0 = transpose ? column * imageTileDimension : row * imageTileDimension;
-                    for (let i = 0; i < records.length; i++) {
-
-                        const rec = records[i];
-                        let x = Math.floor((rec.bin1 - x0));
-                        let y = Math.floor((rec.bin2 - y0));
-
-                        if (transpose) {
-                            const t = y;
-                            y = x;
-                            x = t;
-                        }
-
-                        let rgba
-                        switch (this.displayMode) {
-
-                            case 'AOB':
-                            case 'BOA':
-                                let key = rec.getKey();
-                                let controlRec = controlRecords[key];
-                                if (!controlRec) {
-                                    continue;    // Skip
-                                }
-                                let score = (rec.counts / averageCount) / (controlRec.counts / ctrlAverageCount);
-
-                                rgba = this.ratioColorScale.getColor(score);
-
-                                break;
-
-                            case 'AMB':
-                                key = rec.getKey();
-                                controlRec = controlRecords[key];
-                                if (!controlRec) {
-                                    continue;    // Skip
-                                }
-                                score = averageAcrossMapAndControl * ((rec.counts / averageCount) - (controlRec.counts / ctrlAverageCount));
-
-                                rgba = this.diffColorScale.getColor(score);
-
-                                break;
-
-                            default:    // Either 'A' or 'B'
-                                rgba = this.colorScale.getColor(rec.counts);
-                        }
-
-                        // TODO -- verify that this bitblting is faster than fillRect
-                        setPixel(id, x, y, rgba.red, rgba.green, rgba.blue, rgba.alpha);
-                        if (sameChr && row === column) {
-                            setPixel(id, y, x, rgba.red, rgba.green, rgba.blue, rgba.alpha);
-                        }
-
-                    }
-
-                    ctx.putImageData(id, 0, 0);
-                } else {
-                    //console.log("No block for " + blockNumber);
-                }
-
-                //Draw 2D tracks
-                ctx.save();
-                ctx.lineWidth = 2;
-                for (let track2D of this.browser.tracks2D) {
-
-                    if (track2D.isVisible) {
-
-                        const chr1Name = zd.chr1.name;
-                        const chr2Name = zd.chr2.name;
-                        const features = track2D.getFeatures(chr1Name, chr2Name);
-
-                        if (features) {
-
-                            for (let {chr1, x1, x2, y1, y2, color} of features) {
-
-                                // Chr name order
-                                const flip = chr1Name !== chr1;
-
-                                const fx1 = transpose || flip ? y1 : x1;
-                                const fx2 = transpose || flip ? y2 : x2;
-                                const fy1 = transpose || flip ? x1 : y1;
-                                const fy2 = transpose || flip ? x2 : y2;
-
-                                let px1 = (fx1 - x0bp) / zd.zoom.binSize;
-                                let px2 = (fx2 - x0bp) / zd.zoom.binSize;
-                                let py1 = (fy1 - y0bp) / zd.zoom.binSize;
-                                let py2 = (fy2 - y0bp) / zd.zoom.binSize;
-                                let w = px2 - px1;
-                                let h = py2 - py1;
-
-                                const dim = Math.max(image.width, image.height);
-                                if (px2 > 0 && px1 < dim && py2 > 0 && py1 < dim) {
-                                    //console.log(`${row} ${column}    ${x1} ${x2}`)
-                                    ctx.strokeStyle = track2D.color ? track2D.color : color;
-                                    ctx.strokeRect(px1, py1, w, h);
-                                    if (sameChr && row === column) {
-                                        ctx.strokeRect(py1, px1, h, w);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-
-                ctx.restore();
-
-                // Uncomment to reveal tile boundaries for debugging.
-                //  ctx.fillStyle = "rgb(255,255,255)";
-                //  ctx.strokeRect(0, 0, image.width - 1, image.height - 1)
-
-
-                var imageTile = {row: row, column: column, blockBinCount: imageTileDimension, image: image}
-
-
-                if (this.imageTileCacheLimit > 0) {
-                    if (this.imageTileCacheKeys.length > this.imageTileCacheLimit) {
-                        delete this.imageTileCache[this.imageTileCacheKeys[0]]
-                        this.imageTileCacheKeys.shift()
-                    }
-                    this.imageTileCache[key] = imageTile
-
-                }
-
-                return imageTile;
-
-            } finally {
-                //console.log("Finish load for " + key)
-                this.drawsInProgress.delete(key)
-                this.stopSpinner()
+            if (tile.inProgress) {
+                this.paintTile({...tile, image: inProgressTile(tile.blockBinCount)}, liveState);
+            } else if (tile.image) {
+                this.paintTile(tile, liveState);
             }
         }
 
-
-        function setPixel(imageData, x, y, r, g, b, a) {
-            const index = (x + y * imageData.width) * 4;
-            imageData.data[index + 0] = r;
-            imageData.data[index + 1] = g;
-            imageData.data[index + 2] = b;
-            imageData.data[index + 3] = a;
+        if (undefined !== binSize) {
+            this.genomicExtent = {
+                chr1: state.chr1,
+                chr2: state.chr2,
+                x: state.x * binSize,
+                y: state.y * binSize,
+                w: viewportWidth * binSize / state.pixelSize,
+                h: viewportHeight * binSize / state.pixelSize
+            };
         }
-
-    };
-
-    /**
-     * Return a promise to adjust the color scale, if needed.  This function might need to load the contact
-     * data to computer scale.
-     *
-     * @param zd
-     * @param row1
-     * @param row2
-     * @param col1
-     * @param col2
-     * @param normalization
-     * @returns {*}
-     */
-    async checkColorScale(ds, zd, row1, row2, col1, col2, normalization) {
-
-        const colorKey = colorScaleKey(this.browser.state, this.displayMode);   // This doesn't feel right, state should be an argument
-        if ('AOB' === this.displayMode || 'BOA' === this.displayMode) {
-            return this.ratioColorScale;     // Don't adjust color scale for A/B.
-        }
-
-        if (this.colorScaleThresholdCache[colorKey]) {
-            const changed = this.colorScale.threshold !== this.colorScaleThresholdCache[colorKey];
-            this.colorScale.setThreshold(this.colorScaleThresholdCache[colorKey]);
-            if (changed) {
-                this.browser.eventBus.post(HICEvent("ColorScale", this.colorScale));
-            }
-            return this.colorScale;
-        } else {
-            try {
-                const widthInBP = imageTileDimension * zd.zoom.binSize;
-                const x0bp = col1 * widthInBP;
-                const xWidthInBP = (col2 - col1 + 1) * widthInBP;
-                const region1 = {chr: zd.chr1.name, start: x0bp, end: x0bp + xWidthInBP};
-                const y0bp = row1 * widthInBP;
-                const yWidthInBp = (row2 - row1 + 1) * widthInBP;
-                const region2 = {chr: zd.chr2.name, start: y0bp, end: y0bp + yWidthInBp};
-                const records = await ds.getContactRecords(normalization, region1, region2, zd.zoom.unit, zd.zoom.binSize, true);
-
-                let s = computePercentile(records, 95);
-                if (!isNaN(s)) {  // Can return NaN if all blocks are empty
-                    if (0 === zd.chr1.index) s *= 4;   // Heuristic for whole genome view
-                    this.colorScale = new ColorScale(this.colorScale);
-                    this.colorScale.setThreshold(s);
-                    this.computeColorScale = false;
-                    this.browser.eventBus.post(HICEvent("ColorScale", this.colorScale));
-                    this.colorScaleThresholdCache[colorKey] = s;
-                }
-
-                return this.colorScale;
-            } finally {
-                this.stopSpinner()
-            }
-
-
-        }
-
     }
 
     async zoomIn() {
-        const state = this.browser.state
-        const viewportWidth = this.$viewport.width()
-        const viewportHeight = this.$viewport.height()
-        const matrices = await getMatrices.call(this, state.chr1, state.chr2)
+        const state = this.browser.state;
+        const viewportWidth = this.viewportElement.offsetWidth;
+        const viewportHeight = this.viewportElement.offsetHeight;
+        // The same matrix and resolution the tile pass drew from, so the extent
+        // computed here is in the same units as `this.genomicExtent`, which is
+        // recorded off `tile.binSize`. At the sentinel rung both are the
+        // whole-genome matrix's, which states its bins in kb where every
+        // declared rung states them in bp. The two never meet: the one caller
+        // (`interactionHandler._applyStateChange`) runs this only when
+        // `resolutionChanged` is false, and moving on or off the sentinel is
+        // always a resolution change. ADR-0010 decision 3.
+        const view = this.browser.dataset.matrixViewForZoom(state.chr1, state.chr2, state.zoom);
+        const matrices = await getMatrices.call(this, view.chr1, view.chr2);
 
-        var matrix = matrices[0];
+        const matrix = matrices[0];
 
         if (matrix) {
             const unit = "BP";
-            const zd = await matrix.getZoomDataByIndex(state.zoom, unit);
+            const zd = await matrix.getZoomDataByIndex(view.zoomIndex, unit);
             const newGenomicExtent = {
                 x: state.x * zd.zoom.binSize,
                 y: state.y * zd.zoom.binSize,
                 w: viewportWidth * zd.zoom.binSize / state.pixelSize,
                 h: viewportHeight * zd.zoom.binSize / state.pixelSize
-            }
+            };
 
             // Zoom out not supported
-            if (newGenomicExtent.w > this.genomicExtent.w) return
+            if (newGenomicExtent.w > this.genomicExtent.w) return;
 
-            const sx = ((newGenomicExtent.x - this.genomicExtent.x) / this.genomicExtent.w) * viewportWidth
-            const sy = ((newGenomicExtent.y - this.genomicExtent.y) / this.genomicExtent.w) * viewportHeight
-            const sWidth = (newGenomicExtent.w / this.genomicExtent.w) * viewportWidth
-            const sHeight = (newGenomicExtent.h / this.genomicExtent.h) * viewportHeight
-            const img = this.$canvas[0]
+            const sx = ((newGenomicExtent.x - this.genomicExtent.x) / this.genomicExtent.w) * viewportWidth;
+            const sy = ((newGenomicExtent.y - this.genomicExtent.y) / this.genomicExtent.h) * viewportHeight;
+            const sWidth = (newGenomicExtent.w / this.genomicExtent.w) * viewportWidth;
+            const sHeight = (newGenomicExtent.h / this.genomicExtent.h) * viewportHeight;
+            const img = this.canvasElement;
 
             const backCanvas = document.createElement('canvas');
             backCanvas.width = img.width;
             backCanvas.height = img.height;
             const backCtx = backCanvas.getContext('2d');
-            backCtx.drawImage(img, sx, sy, sWidth, sHeight, 0, 0, viewportWidth, viewportHeight)
+            backCtx.drawImage(img, sx, sy, sWidth, sHeight, 0, 0, viewportWidth, viewportHeight);
 
-            this.ctx.clearRect(0, 0, viewportWidth, viewportHeight)
-            this.ctx.drawImage(backCanvas, 0, 0)
+            this.ctx.clearRect(0, 0, viewportWidth, viewportHeight);
+            this.ctx.drawImage(backCanvas, 0, 0);
         }
     }
 
-    paintTile({image, row, column, blockBinCount}) {
+    // The caller supplies the state to place against, having checked it is
+    // still the one this pass belongs to.
+    paintTile({image, row, column, blockBinCount}, liveState) {
 
         const x0 = blockBinCount * column
         const y0 = blockBinCount * row
 
-        const {x, y, pixelSize} = this.browser.state
+        const {x, y, pixelSize} = liveState
         //const pixelSizeInt = Math.max(1, Math.floor(pixelSize))
         const offsetX = (x0 - x) * pixelSize
         const offsetY = (y0 - y) * pixelSize
 
-        const scale = pixelSize; // / pixelSizeInt
+        const scale = pixelSize // / pixelSizeInt
         const scaledWidth = image.width * scale
         const scaledHeight = image.height * scale
 
-        const viewportWidth = this.$viewport.width()
-        const viewportHeight = this.$viewport.height()
-
-        if (offsetX <= viewportWidth && offsetX + scaledWidth >= 0 && offsetY <= viewportHeight && offsetY + scaledHeight >= 0) {
-            this.ctx.fillStyle = this.backgroundRGBString;
-            this.ctx.fillRect(offsetX, offsetY, scaledWidth, scaledHeight);
+        if (offsetX <= this.viewportElement.offsetWidth && offsetX + scaledWidth >= 0 && offsetY <= this.viewportElement.offsetHeight && offsetY + scaledHeight >= 0) {
+            this.ctx.fillStyle = this.backgroundRGBString
+            this.ctx.fillRect(offsetX, offsetY, scaledWidth, scaledHeight)
             if (scale === 1) {
-                this.ctx.drawImage(image, offsetX, offsetY);
+                this.ctx.drawImage(image, offsetX, offsetY)
             } else {
-                this.ctx.drawImage(image, offsetX, offsetY, scaledWidth, scaledHeight);
+                this.ctx.drawImage(image, offsetX, offsetY, scaledWidth, scaledHeight)
             }
             // Debugging aid, uncomment to see tile boundaries
             //this.ctx.strokeRect(offsetX, offsetY, scaledWidth, scaledHeight)
@@ -631,374 +372,287 @@ class ContactMatrixView {
     }
 
     startSpinner() {
-
-        if (true === this.browser.isLoadingHICFile && this.browser.$user_interaction_shield) {
-            this.browser.$user_interaction_shield.show();
+        if (this.browser.isLoadingHICFile && this.browser.userInteractionShield) {
+            this.browser.userInteractionShield.style.display = 'block';
         }
-        this.$fa_spinner.css("display", "inline-block");
-        this.spinnerCount++
+        this.faSpinnerElement.style.display = 'inline-block';
+        this.spinnerCount++;
     }
 
     stopSpinner() {
-        this.spinnerCount--
-        if (0 === this.spinnerCount) {
-            this.$fa_spinner.css("display", "none")
-        }
-        this.spinnerCount = Math.max(0, this.spinnerCount)   // This should not be neccessary
-    }
-
-
-    addMouseHandlers($viewport) {
-
-        let isMouseDown = false;
-        let isSweepZooming = false;
-        let mouseDown;
-        let mouseLast;
-        let mouseOver;
-
-        const panMouseUpOrMouseOut = (e) => {
-            if (true === this.isDragging) {
-                this.isDragging = false;
-                this.browser.eventBus.post(HICEvent("DragStopped"));
-            }
-            isMouseDown = false;
-            mouseDown = mouseLast = undefined;
-        }
-
-        // function shiftCurrentImage(self, dx, dy) {
-        //     var canvasWidth = self.$canvas.width(),
-        //         canvasHeight = self.$canvas.height(),
-        //         imageData;
-        //
-        //     imageData = self.ctx.getImageData(0, 0, canvasWidth, canvasHeight);
-        //     self.ctx.clearRect(0, 0, canvasWidth, canvasHeight);
-        //     self.ctx.putImageData(imageData, dx, dy);
-        // }
-        //
-        // function mouseWheelHandler(e) {
-        //     e.preventDefault();
-        //     e.stopPropagation();
-        //
-        //     const t = Date.now();
-        //     if (lastWheelTime === undefined || (t - lastWheelTime > 1000)) {
-        //         // cross-browser wheel delta  -- Firefox returns a "detail" object that is opposite in sign to wheelDelta
-        //         var direction = e.deltaY < 0 ? 1 : -1,
-        //             coords = DOMUtils.translateMouseCoordinates(e, $viewport[0]),
-        //             x = coords.x,
-        //             y = coords.y;
-        //         self.browser.wheelClickZoom(direction, x, y);
-        //         lastWheelTime = t;
-        //     }
-        // }
-
-
-        this.isDragging = false;
-
-        if (!this.browser.isMobile) {
-
-            $viewport.dblclick((e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                const mouseX = e.offsetX || e.layerX
-                const mouseY = e.offsetY || e.layerX;
-                this.browser.zoomAndCenter(1, mouseX, mouseY);
-            });
-
-            $viewport.on('mouseover', (e) => mouseOver = true)
-
-            $viewport.on('mouseout', (e) => mouseOver = undefined)
-
-            $viewport.on('mousedown', (e) => {
-
-                e.preventDefault();
-                e.stopPropagation();
-
-                if (this.browser.$menu.is(':visible')) {
-                    this.browser.hideMenu();
-                }
-
-                mouseLast = {x: e.offsetX, y: e.offsetY};
-                mouseDown = {x: e.offsetX, y: e.offsetY};
-
-                isSweepZooming = (true === e.altKey);
-                if (isSweepZooming) {
-                    const eFixed = $.event.fix(e);
-                    this.sweepZoom.initialize({x: eFixed.pageX, y: eFixed.pageY});
-                }
-
-                isMouseDown = true;
-
-            })
-
-            $viewport.on('mousemove', (e) => {
-
-                e.preventDefault();
-                e.stopPropagation();
-                const coords =
-                    {
-                        x: e.offsetX,
-                        y: e.offsetY
-                    };
-
-                // Sets pageX and pageY for browsers that don't support them
-                const eFixed = $.event.fix(e);
-
-                const xy =
-                    {
-                        x: eFixed.pageX - $viewport.offset().left,
-                        y: eFixed.pageY - $viewport.offset().top
-                    };
-
-                const {width, height} = $viewport.get(0).getBoundingClientRect();
-                xy.xNormalized = xy.x / width;
-                xy.yNormalized = xy.y / height;
-
-
-                this.browser.eventBus.post(HICEvent("UpdateContactMapMousePosition", xy, false));
-
-                if (true === this.willShowCrosshairs) {
-                    this.browser.updateCrosshairs(xy);
-                    this.browser.showCrosshairs();
-                }
-
-                if (isMouseDown) { // Possibly dragging
-
-                    if (isSweepZooming) {
-                        this.sweepZoom.update({x: eFixed.pageX, y: eFixed.pageY});
-
-                    } else if (mouseDown.x && Math.abs(coords.x - mouseDown.x) > DRAG_THRESHOLD) {
-
-                        this.isDragging = true;
-                        const dx = mouseLast.x - coords.x;
-                        const dy = mouseLast.y - coords.y;
-
-                        // If matrix data is updating shift current map image while we wait
-                        //if (this.updating) {
-                        //    shiftCurrentImage(this, -dx, -dy);
-                        //}
-
-                        this.browser.shiftPixels(dx, dy);
-                    }
-
-                    mouseLast = coords;
-                }
-            })
-
-            $viewport.on('mouseup', panMouseUpOrMouseOut)
-
-            $viewport.on('mouseleave', () => {
-                this.browser.layoutController.xAxisRuler.unhighlightWholeChromosome();
-                this.browser.layoutController.yAxisRuler.unhighlightWholeChromosome();
-                panMouseUpOrMouseOut();
-            })
-
-
-            // Mousewheel events -- ie exposes event only via addEventListener, no onwheel attribute
-            // NOte from spec -- trackpads commonly map pinch to mousewheel + ctrl
-            // $viewport[0].addEventListener("wheel", mouseWheelHandler, 250, false);
-
-            // document level events
-            $(document).on('keydown.contact_matrix_view', (e) => {
-                if (undefined === this.willShowCrosshairs && true === mouseOver && true === e.shiftKey) {
-                    this.willShowCrosshairs = true;
-                    this.browser.eventBus.post(HICEvent('DidShowCrosshairs', 'DidShowCrosshairs', false));
-                }
-            })
-
-            $(document).on('keyup.contact_matrix_view', (e) => {
-                this.browser.hideCrosshairs();
-                this.willShowCrosshairs = undefined;
-                this.browser.eventBus.post(HICEvent('DidHideCrosshairs', 'DidHideCrosshairs', false));
-            })
-
-            // for sweep-zoom allow user to sweep beyond viewport extent
-            // sweep area clamps since viewport mouse handlers stop firing
-            // when the viewport boundary is crossed.
-            $(document).on('mouseup.contact_matrix_view', (e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                if (isSweepZooming) {
-                    isSweepZooming = false;
-                    this.sweepZoom.commit();
-                }
-            })
+        this.spinnerCount--;
+        if (this.spinnerCount === 0) {
+            this.faSpinnerElement.style.display = 'none';
+        } else if (this.spinnerCount < 0) {
+            // An unpaired stop. This used to be clamped away silently, which left
+            // the imbalance to be rediscovered; say so instead, and hide the
+            // spinner so the symptom is a console error rather than a stuck UI.
+            console.error(`ContactMatrixView: unpaired stopSpinner, count is ${this.spinnerCount}`);
+            this.spinnerCount = 0;
+            this.faSpinnerElement.style.display = 'none';
         }
     }
-
 
     /**
-     * Add touch handlers.  Touches are mapped to one of the following application level events
-     *  - double tap, equivalent to double click
-     *  - move
-     *  - pinch
+     * Wire the viewport's mouse, wheel and key events to the gesture
+     * recognizer, and carry out what it recognizes.
      *
-     * @param $viewport
+     * What stays here is what the recognizer must not hold: converting each
+     * event to viewport pixels, and registering listeners. Each event keeps the
+     * coordinate source it has always read -- `offsetX` for drag, double-click
+     * and wheel, client-minus-rect for the sweep, page-minus-offset for the
+     * crosshairs. They agree only when the page is laid out simply, and JSDOM
+     * cannot tell them apart, so unifying them is a behaviour change to make
+     * deliberately, not here.
      */
+    addMouseHandlers(viewportElement) {
 
-    addTouchHandlers($viewport) {
+        if (this.browser.isMobile) return;
 
-        let lastTouch, pinch;
-        const viewport = $viewport[0];
+        const recognizer = this.gestureRecognizer;
 
-        /**
-         * Touch start -- 3 possibilities
-         *   (1) beginning of a drag (pan)
-         *   (2) first tap of a double tap
-         *   (3) beginning of a pinch
-         */
-        viewport.ontouchstart = (ev) => {
+        // The position the crosshairs follow: page-minus-offset.
+        const pointerIn = (e) => {
+            const { top, left } = getOffset(viewportElement)
+            const rect = viewportElement.getBoundingClientRect();
 
-            ev.preventDefault();
-            ev.stopPropagation();
-
-            var touchCoords = translateTouchCoordinates(ev.targetTouches[0], viewport),
-                offsetX = touchCoords.x,
-                offsetY = touchCoords.y,
-                count = ev.targetTouches.length,
-                timeStamp = ev.timeStamp || Date.now(),
-                resolved = false,
-                dx, dy, dist, direction;
-
-            if (count === 2) {
-                touchCoords = translateTouchCoordinates(ev.targetTouches[0], viewport);
-                offsetX = (offsetX + touchCoords.x) / 2;
-                offsetY = (offsetY + touchCoords.y) / 2;
-            }
-
-            // NOTE: If the user makes simultaneous touches, the browser may fire a
-            // separate touchstart event for each touch point. Thus if there are
-            // two simultaneous touches, the first touchstart event will have
-            // targetTouches length of one and the second event will have a length
-            // of two.  In this case replace previous touch with this one and return
-            if (lastTouch && (timeStamp - lastTouch.timeStamp < DOUBLE_TAP_TIME_THRESHOLD) && ev.targetTouches.length > 1 && lastTouch.count === 1) {
-                lastTouch = {x: offsetX, y: offsetY, timeStamp: timeStamp, count: ev.targetTouches.length};
-                return;
-            }
-
-
-            if (lastTouch && (timeStamp - lastTouch.timeStamp < DOUBLE_TAP_TIME_THRESHOLD)) {
-
-                direction = (lastTouch.count === 2 || count === 2) ? -1 : 1;
-                dx = lastTouch.x - offsetX;
-                dy = lastTouch.y - offsetY;
-                dist = Math.sqrt(dx * dx + dy * dy);
-
-                if (dist < DOUBLE_TAP_DIST_THRESHOLD) {
-                    this.browser.zoomAndCenter(direction, offsetX, offsetY);
-                    lastTouch = undefined;
-                    resolved = true;
-                }
-            }
-
-            if (!resolved) {
-                lastTouch = {x: offsetX, y: offsetY, timeStamp: timeStamp, count: ev.targetTouches.length};
-            }
-        }
-
-        viewport.ontouchmove = hicUtils.throttle((ev) => {
-
-            var touchCoords1, touchCoords2, t;
-
-            ev.preventDefault();
-            ev.stopPropagation();
-
-            if (ev.targetTouches.length === 2) {
-
-                // Update pinch  (assuming 2 finger movement is a pinch)
-                touchCoords1 = translateTouchCoordinates(ev.targetTouches[0], viewport);
-                touchCoords2 = translateTouchCoordinates(ev.targetTouches[1], viewport);
-
-                t = {
-                    x1: touchCoords1.x,
-                    y1: touchCoords1.y,
-                    x2: touchCoords2.x,
-                    y2: touchCoords2.y
+            const pointer =
+                {
+                    x: e.pageX - left,
+                    y: e.pageY - top
                 };
+            pointer.xNormalized = pointer.x / rect.width;
+            pointer.yNormalized = pointer.y / rect.height;
+            return pointer;
+        };
 
-                if (pinch) {
-                    pinch.end = t;
-                } else {
-                    pinch = {start: t};
-                }
-            } else {
-                // Assuming 1 finger movement is a drag
+        viewportElement.addEventListener('mousedown', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
 
-                var touchCoords = translateTouchCoordinates(ev.targetTouches[0], viewport),
-                    offsetX = touchCoords.x,
-                    offsetY = touchCoords.y;
-                if (lastTouch) {
-                    var dx = lastTouch.x - offsetX,
-                        dy = lastTouch.y - offsetY;
-                    if (!isNaN(dx) && !isNaN(dy)) {
-                        this.isDragging = true
-                        this.browser.shiftPixels(lastTouch.x - offsetX, lastTouch.y - offsetY);
-                    }
-                }
-
-                lastTouch = {
-                    x: offsetX,
-                    y: offsetY,
-                    timeStamp: ev.timeStamp || Date.now(),
-                    count: ev.targetTouches.length
-                };
+            if (this.browser.menuElement?.style.display === 'block') {
+                this.browser.hideMenu();
             }
 
-        }, 50);
+            const { top, left } = viewportElement.getBoundingClientRect()
+            this.carryOut(recognizer.mouseDown({
+                x: e.offsetX,
+                y: e.offsetY,
+                sweepX: e.clientX - left,
+                sweepY: e.clientY - top,
+                altKey: e.altKey
+            }));
+        })
 
-        viewport.ontouchend = (ev) => {
+        viewportElement.addEventListener('mousemove', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
 
-            ev.preventDefault();
-            ev.stopPropagation();
+            const rect = viewportElement.getBoundingClientRect();
+            const pointer = pointerIn(e);
 
-            if (pinch && pinch.end !== undefined) {
+            this.browser.coordinator.onUpdateContactMapMousePosition(pointer);
 
-                var startT = pinch.start,
-                    endT = pinch.end,
-                    dxStart = startT.x2 - startT.x1,
-                    dyStart = startT.y2 - startT.y1,
-                    dxEnd = endT.x2 - endT.x1,
-                    dyEnd = endT.y2 - endT.y1,
-                    distStart = Math.sqrt(dxStart * dxStart + dyStart * dyStart),
-                    distEnd = Math.sqrt(dxEnd * dxEnd + dyEnd * dyEnd),
-                    scale = distEnd / distStart,
-                    deltaX = (endT.x1 + endT.x2) / 2 - (startT.x1 + startT.x2) / 2,
-                    deltaY = (endT.y1 + endT.y2) / 2 - (startT.y1 + startT.y2) / 2,
-                    anchorPx = (startT.x1 + startT.x2) / 2,
-                    anchorPy = (startT.y1 + startT.y2) / 2;
+            this.carryOut(recognizer.mouseMove({
+                x: e.offsetX,
+                y: e.offsetY,
+                sweepX: e.clientX - rect.left,
+                sweepY: e.clientY - rect.top,
+                pointer
+            }));
+        })
 
-                if (scale < 0.8 || scale > 1.2) {
-                    lastTouch = undefined;
-                    this.browser.pinchZoom(anchorPx, anchorPy, scale);
-                }
-            } else if (this.isDragging) {
-                this.isDragging = false;
-                this.browser.eventBus.post(HICEvent("DragStopped"));
-            }
+        viewportElement.addEventListener('mouseup', () => this.carryOut(recognizer.mouseUp()))
 
-            // a touch end always ends a pinch
-            pinch = undefined;
+        viewportElement.addEventListener('dblclick', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            this.carryOut(recognizer.doubleClick({ x: e.offsetX, y: e.offsetY }));
+        })
 
-        }
+        viewportElement.addEventListener('wheel', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            this.carryOut(recognizer.wheel({ x: e.offsetX, y: e.offsetY, deltaY: e.deltaY }));
+        })
 
-        function translateTouchCoordinates(e, target) {
+        viewportElement.addEventListener('mouseover', (e) => this.carryOut(recognizer.mouseOver({ shiftKey: e.shiftKey, pointer: pointerIn(e) })))
+        viewportElement.addEventListener('mouseout', () => this.carryOut(recognizer.mouseOut()))
 
-            var $target = $(target),
-                posx,
-                posy;
-            posx = e.pageX - $target.offset().left;
-            posy = e.pageY - $target.offset().top;
-            return {x: posx, y: posy}
-        }
+        viewportElement.addEventListener('mouseleave', () => {
+            this.browser.layoutController.xAxisRuler.unhighlightWholeChromosome();
+            this.browser.layoutController.yAxisRuler.unhighlightWholeChromosome();
+            this.carryOut(recognizer.mouseLeave());
+        })
 
+        this.addDocumentListener('keydown', (e) => this.carryOut(recognizer.keyDown({ shiftKey: e.shiftKey })))
+
+        this.addDocumentListener('keyup', () => this.carryOut(recognizer.keyUp()))
+
+        this.addDocumentListener('mouseup', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            this.carryOut(recognizer.documentMouseUp());
+        })
     }
 
+    /**
+     * Wire the viewport's touch events to the gesture recognizer: double tap,
+     * one-finger pan and pinch. Touch coordinates are page-minus-rect.
+     *
+     * Touch-move is throttled here, not in the recognizer, which has no clock.
+     */
+    addTouchHandlers(viewportElement) {
+
+        const recognizer = this.gestureRecognizer;
+
+        const touchesIn = (ev) => {
+            const rect = viewportElement.getBoundingClientRect();
+            return Array.from(ev.targetTouches, ({ pageX, pageY }) => ({ x: pageX - rect.left, y: pageY - rect.top }));
+        };
+
+        viewportElement.ontouchstart = (ev) => {
+            ev.preventDefault();
+            ev.stopPropagation();
+            this.carryOut(recognizer.touchStart({ touches: touchesIn(ev), timeStamp: ev.timeStamp || Date.now() }));
+        };
+
+        viewportElement.ontouchmove = hicUtils.throttle((ev) => {
+            ev.preventDefault();
+            ev.stopPropagation();
+            this.carryOut(recognizer.touchMove({ touches: touchesIn(ev), timeStamp: ev.timeStamp || Date.now() }));
+        }, 50);
+
+        viewportElement.ontouchend = (ev) => {
+            ev.preventDefault();
+            ev.stopPropagation();
+            this.carryOut(recognizer.touchEnd());
+        };
+    }
+
+    /**
+     * Carry out the intents the gesture recognizer named, in order. Each goes
+     * where it went before the recognizer existed: through the browser's
+     * forwarding methods, the interaction handler, the sweep zoom, or the bus.
+     * The host hears of the crosshairs from the browser, not from here.
+     */
+    carryOut(intents) {
+        for (const intent of intents) {
+            switch (intent.type) {
+                case 'pan':
+                    this.browser.shiftPixels(intent.dx, intent.dy).catch(err => console.error('Error in shiftPixels:', err));
+                    break;
+                case 'dragStopped':
+                    this.browser.eventBus.post(HICEvent("DragStopped"));
+                    break;
+                case 'zoomAndCenter':
+                    this.browser.zoomAndCenter(intent.direction, intent.x, intent.y);
+                    break;
+                case 'wheelZoom':
+                    this.browser.interactions.handleWheelZoom(intent.x, intent.y, intent.scaleFactor)
+                        .catch(err => console.error('Error in handleWheelZoom:', err));
+                    break;
+                case 'pinchZoom':
+                    this.browser.pinchZoom(intent.x, intent.y, intent.scale);
+                    break;
+                case 'sweepStart':
+                    this.sweepZoom.initialize(intent.x, intent.y);
+                    break;
+                case 'sweepUpdate':
+                    this.sweepZoom.update({
+                        left: `${intent.left}px`,
+                        top: `${intent.top}px`,
+                        width: `${intent.width}px`,
+                        height: `${intent.height}px`,
+                    });
+                    break;
+                case 'sweepCommit':
+                    this.sweepZoom.commit(intent.rect).catch(err => console.error('Error in sweepZoom.commit:', err));
+                    break;
+                case 'showCrosshairs':
+                    // Nothing to carry out: there is no position until the
+                    // first move, and that move is what shows them.
+                    break;
+                case 'moveCrosshairs':
+                    this.browser.moveCrosshairs(intent.pointer);
+                    break;
+                case 'hideCrosshairs':
+                    this.browser.releaseCrosshairs();
+                    break;
+                default:
+                    throw new Error(`ContactMatrixView: unknown gesture intent '${intent.type}'`);
+            }
+        }
+    }
+
+    async render2DTracks(track2DList, dataset, state) {
+
+        // Resolved the same way the tile pass resolves it, so `bpPerPixel` below
+        // is in the matrix's own units. At the sentinel rung that is the
+        // whole-genome matrix, whose axes are named `All` -- so a 2D track keyed
+        // to the scaffold matches nothing and draws nothing, exactly as it does
+        // in the whole-genome view the sentinel replaces. One rung in, it is
+        // back. ADR-0010 decision 3.
+        const view = dataset.matrixViewForZoom(state.chr1, state.chr2, state.zoom)
+        const matrix = await dataset.getMatrix(view.chr1, view.chr2)
+        const zoomData = matrix.getZoomDataByIndex(view.zoomIndex, 'BP')
+
+        const { width, height } = this.getViewDimensions()
+        const bpPerPixel = zoomData.zoom.binSize/state.pixelSize
+        const { xStartBP, yStartBP, xEndBP, yEndBP } =  getLocus(dataset, state, width, height, bpPerPixel)
+
+        const chr1Name = zoomData.chr1.name
+        const chr2Name = zoomData.chr2.name
+
+        const sameChr = zoomData.chr1.index === zoomData.chr2.index
+
+        this.ctx.save()
+        this.ctx.lineWidth = 2
+
+        const strokeFeatureRect = ({ xS, xE, yS, yE }) => {
+
+            if (xE < xStartBP || xS > xEndBP || yE < yStartBP || yS > yEndBP) {
+                // trivially reject
+            } else {
+                const w = Math.max(1, (xE - xS)/bpPerPixel)
+                const h = Math.max(1, (yE - yS)/bpPerPixel)
+                const x = Math.floor((xS - xStartBP)/bpPerPixel)
+                const y = Math.floor((yS - yStartBP)/bpPerPixel)
+                this.ctx.strokeRect(x, y, w, h)
+            }
+
+        }
+
+        const renderFeatures = (track2D, features, mirrored) => {
+            for (const feature of features) {
+                this.ctx.strokeStyle = track2D.color || feature.color
+                strokeFeatureRect(resolveFeatureAxes(feature, chr1Name, mirrored))
+            }
+        }
+
+        for (const track2D of track2DList) {
+
+            if (false === track2D.isVisible) {
+                continue
+            }
+
+            const features = track2D.getFeatures(chr1Name, chr2Name)
+
+            if (features) {
+                for (const mirrored of featureDrawPasses(track2D.displayMode, sameChr)) {
+                    renderFeatures(track2D, features, mirrored)
+                }
+            }
+
+
+        }
+
+        this.ctx.restore()
+
+    }
 }
 
 ContactMatrixView.defaultBackgroundColor = {r: 255, g: 255, b: 255}
-
-function colorScaleKey(state, displayMode) {
-    return "" + state.chr1 + "_" + state.chr2 + "_" + state.zoom + "_" + state.normalization + "_" + displayMode;
-}
 
 /**
  * Returns a promise for an image tile
@@ -1016,48 +670,91 @@ function inProgressTile(imageSize) {
 
     let image = inProgressCache[imageSize]
     if (!image) {
-        image = document.createElement('canvas');
-        image.width = imageSize;
-        image.height = imageSize;
-        const ctx = image.getContext('2d');
-        ctx.font = '24px sans-serif';
+        image = document.createElement('canvas')
+        image.width = imageSize
+        image.height = imageSize
+        const ctx = image.getContext('2d')
+        ctx.font = '24px sans-serif'
         ctx.fillStyle = 'rgb(230, 230, 230)'
         ctx.fillRect(0, 0, image.width, image.height)
         ctx.fillStyle = 'black'
         for (let i = 100; i < imageSize; i += 300) {
             for (let j = 100; j < imageSize; j += 300) {
-                ctx.fillText('Loading...', i, j);
+                ctx.fillText('Loading...', i, j)
             }
         }
         inProgressCache[imageSize] = image
     }
-    return image;
+    return image
+}
+
+/**
+ * Resolve which of a 2D feature's coordinate pairs belongs on which axis.
+ *
+ * A feature is filed under a canonical chromosome key, so the order it stores
+ * (`chr1`, `chr2`) may be reversed relative to the axes of the zoom data being
+ * drawn. When it is, the feature's x range describes the y axis and vice versa.
+ *
+ * `mirrored` requests the reflected draw used for the upper triangle. The two
+ * swaps compose: applying both cancels out.
+ *
+ * @param {Object} feature - A 2D feature: {chr1, x1, x2, y1, y2}
+ * @param {string} chr1Name - Name of the chromosome on the x axis
+ * @param {boolean} mirrored - Reflect across the diagonal
+ * @returns {{xS: number, xE: number, yS: number, yE: number}} BP extents per axis
+ */
+function resolveFeatureAxes({ chr1, x1, x2, y1, y2 }, chr1Name, mirrored) {
+    const reversed = chr1Name !== chr1
+    return reversed !== mirrored
+        ? { xS: y1, xE: y2, yS: x1, yE: x2 }
+        : { xS: x1, xE: x2, yS: y1, yE: y2 }
+}
+
+/**
+ * The draw passes a 2D track needs for the current view, as `mirrored` flags to
+ * feed resolveFeatureAxes. An empty list means the track draws nothing.
+ *
+ * The mode is the 2D track's own setting ('COLLAPSED' | 'lower' | 'upper' |
+ * undefined), not the browser display mode in CONTEXT.md. An unrecognized mode
+ * draws nothing, as it did before this function existed.
+ *
+ * An inter-chromosomal view has no diagonal to reflect across, so it draws a
+ * single un-mirrored pass whatever the mode asks for; a mirrored pass would put
+ * a phantom copy of every feature at transposed coordinates.
+ *
+ * @param {string|undefined} track2DDisplayMode - The 2D track's display mode
+ * @param {boolean} sameChr - Whether both axes show the same chromosome
+ * @returns {boolean[]} One `mirrored` flag per pass
+ */
+function featureDrawPasses(track2DDisplayMode, sameChr) {
+
+    let passes
+    if ('COLLAPSED' === track2DDisplayMode || undefined === track2DDisplayMode) {
+        passes = [ false, true ]
+    } else if ('lower' === track2DDisplayMode) {
+        passes = [ false ]
+    } else if ('upper' === track2DDisplayMode) {
+        passes = [ true ]
+    } else {
+        passes = []
+    }
+
+    return sameChr || 0 === passes.length ? passes : [ false ]
 }
 
 function getMatrices(chr1, chr2) {
 
-    var promises = [];
+    var promises = []
     if ('B' === this.displayMode && this.browser.controlDataset) {
-        promises.push(this.browser.controlDataset.getMatrix(chr1, chr2));
+        promises.push(this.browser.controlDataset.getMatrix(chr1, chr2))
     } else {
-        promises.push(this.browser.dataset.getMatrix(chr1, chr2));
+        promises.push(this.browser.dataset.getMatrix(chr1, chr2))
         if (this.displayMode && 'A' !== this.displayMode && this.browser.controlDataset) {
-            promises.push(this.browser.controlDataset.getMatrix(chr1, chr2));
+            promises.push(this.browser.controlDataset.getMatrix(chr1, chr2))
         }
     }
-    return Promise.all(promises);
+    return Promise.all(promises)
 }
 
-
-function computePercentile(records, p) {
-    const counts = records.map(r => r.counts)
-    counts.sort(function (a, b) {
-        return a - b;
-    })
-    const idx = Math.floor((p / 100) * records.length);
-    return counts[idx];
-
-    // return HICMath.percentile(array, p);
-}
-
+export { resolveFeatureAxes, featureDrawPasses }
 export default ContactMatrixView

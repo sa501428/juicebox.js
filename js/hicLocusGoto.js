@@ -24,59 +24,63 @@
 /**
  * Created by dat on 3/3/17.
  */
-import $ from '../vendor/jquery-3.3.1.slim.js'
-import {StringUtils} from '../node_modules/igv-utils/src/index.js'
+import {prettyPrint} from "./utils.js"
 
 class LocusGoto {
 
-    constructor(browser, $hic_navbar_container) {
-
+    constructor(browser, hicNavbarContainer) {
         this.browser = browser;
 
-        const $parent = $hic_navbar_container.find("div[id$='upper-hic-nav-bar-widget-container']");
+        const parentElement = hicNavbarContainer.querySelector("div[id$='upper-hic-nav-bar-widget-container']");
 
-        this.$container = $("<div>", {class: 'hic-chromosome-goto-container', title: 'Chromosome Goto'});
-        $parent.append(this.$container);
+        this.containerElement = document.createElement('div');
+        this.containerElement.className = 'hic-chromosome-goto-container';
+        this.containerElement.title = 'Chromosome Goto';
+        parentElement.appendChild(this.containerElement);
 
-        this.$resolution_selector = $('<input type="text" placeholder="chr-x-axis chr-y-axis">');
-        this.$container.append(this.$resolution_selector);
+        this.resolutionSelectorElement = document.createElement('input');
+        this.resolutionSelectorElement.type = 'text';
+        this.resolutionSelectorElement.placeholder = 'chr-x-axis chr-y-axis';
+        this.containerElement.appendChild(this.resolutionSelectorElement);
 
-        this.$resolution_selector.on('change', function (e) {
-            browser.parseGotoInput($(this).val());
-            $(this).blur();
+        this.resolutionSelectorElement.addEventListener('change', (e) => {
+            this.browser.parseGotoInput(this.resolutionSelectorElement.value);
+            this.resolutionSelectorElement.blur();
         });
 
-        this.browser.eventBus.subscribe("LocusChange", this);
+        // Note: LocusChange subscription removed - now handled by BrowserCoordinator
+        // Locus goto widget is updated via coordinator.onLocusChange()
     }
 
-    receiveEvent(event) {
+    /**
+     * Show the loci a view state is looking at.
+     *
+     * @param {State} state - The view state to describe; defaults to the
+     *   browser's current one.
+     */
+    updateForState(state) {
 
-        if (event.type === "LocusChange") {
+        let loci;
+        const viewState = state || this.browser.state;
+        const isWholeGenome = this.browser.dataset.isWholeGenome(viewState.chr1);
+        if (isWholeGenome) {
+            loci = 'All';
+        } else {
 
-            let xy;
-            const state = event.data.state || this.browser.state;
-            const isWholeGenome = this.browser.dataset.isWholeGenome(state.chr1);
-            if (isWholeGenome) {
-                xy = 'All';
-            } else {
-                const chr1 = this.browser.dataset.chromosomes[state.chr1];
-                const chr2 = this.browser.dataset.chromosomes[state.chr2];
-                const bpPerBin = this.browser.dataset.bpResolutions[state.zoom];
-                const dimensionsPixels = this.browser.contactMatrixView.getViewDimensions();
-                const pixelsPerBin = state.pixelSize;
-                const startBP1 = 1 + Math.round(state.x * bpPerBin);
-                const startBP2 = 1 + Math.round(state.y * bpPerBin);
-                const endBP1 = Math.min(chr1.size, Math.round(((dimensionsPixels.width / pixelsPerBin) * bpPerBin)) + startBP1 - 1);
-                const endBP2 = Math.min(chr2.size, Math.round(((dimensionsPixels.height / pixelsPerBin) * bpPerBin)) + startBP2 - 1);
+            const viewDimensions = this.browser.contactMatrixView.getViewDimensions()
+            const locus = viewState.getLocus(this.browser.dataset, viewDimensions)
 
-                xy = chr1.name + ":" + StringUtils.numberFormatter(startBP1) + "-" + StringUtils.numberFormatter(endBP1) + " " +
-                    chr2.name + ":" + StringUtils.numberFormatter(startBP2) + "-" + StringUtils.numberFormatter(endBP2);
+            const { chr:chrX, start:sX, end:eX } = locus.x
+            const strX = `${chrX}:${prettyPrint(1 + sX)}-${prettyPrint(eX)}`
 
-            }
-            this.$resolution_selector.val(xy);
+            const { chr:chrY, start:sY, end:eY } = locus.y
+            const strY = `${chrY}:${prettyPrint(1 + sY)}-${prettyPrint(eY)}`
+
+            loci = `${strX} ${strY}`
+
         }
+        this.resolutionSelectorElement.value = loci;
     }
 }
 
-
-export default LocusGoto
+export default LocusGoto;

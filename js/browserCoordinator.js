@@ -1,0 +1,596 @@
+/*
+ *  The MIT License (MIT)
+ *
+ * Copyright (c) 2016-2017 The Regents of the University of California
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
+ * associated documentation files (the "Software"), to deal in the Software without restriction, including
+ * without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the
+ * following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all copies or substantial
+ * portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING
+ * BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,  FITNESS FOR A PARTICULAR PURPOSE AND
+ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+ * CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+
+import {hitTestBbox} from "./utils.js"
+
+/**
+ * BrowserCoordinator handles all browser component orchestration.
+ * 
+ * This class replaces the event bus pattern for internal orchestration with explicit,
+ * traceable method calls. It coordinates updates to UI components when browser state changes,
+ * providing a clear API for both internal updates and external integration.
+ * 
+ * Benefits:
+ * - Explicit: Can see exactly what happens in one place
+ * - Traceable: Easy to set breakpoints and debug
+ * - Testable: Can mock components easily
+ * - External integration: Clear API for external apps (e.g., Spacewalk)
+ * - No magic: Everything is explicit, no hidden subscriptions
+ */
+class BrowserCoordinator {
+
+    /**
+     * @param {HICBrowser} browser - The browser instance this coordinator serves
+     */
+    constructor(browser) {
+        this.browser = browser;
+        this.rulers = {
+            x: browser.layoutController.xAxisRuler,
+            y: browser.layoutController.yAxisRuler
+        };
+        // Both set by adoptWidgets(). The coordinator is constructed before the
+        // widgets because their observer closures notify it directly -- see
+        // createWidgets().
+        this.widgets = undefined;
+        this.contactMatrixView = undefined;
+        this.externalCallbacks = {
+            onMapLoaded: [],
+            onControlMapLoaded: [],
+            onLocusChange: [],
+            onGenomeChange: [],
+            onBackgroundColorChange: [],
+            onForegroundColorChange: [],
+            onSyncRefused: [],
+            onCrosshairsMove: [],
+            onCrosshairsHide: []
+        };
+    }
+
+    /**
+     * Take ownership of the record returned by createWidgets().
+     *
+     * The coordinator fans out to widgets, rulers and the contact matrix view, and
+     * CONTEXT.md keeps those three apart -- so the contact matrix view is held on
+     * its own rather than filed under `widgets`. The record also carries the sweep-
+     * zoom gesture helper and the image tile source, which are none of the three:
+     * the contact matrix view owns them and the coordinator never touches them.
+     *
+     * @param {Object} record - the record returned by createWidgets()
+     */
+    adoptWidgets(record) {
+        const { contactMatrixView, sweepZoom, imageTileSource, ...widgets } = record;
+        this.contactMatrixView = contactMatrixView;
+        this.widgets = widgets;
+    }
+
+    /**
+     * Orchestrate component updates when a map is loaded.
+     * 
+     * This method explicitly calls each component that needs to be updated,
+     * making it easy to see what happens and debug issues.
+     * 
+     * @param {Dataset} dataset - The loaded dataset
+     * @param {State} state - The current state
+     * @param {('live'|'hic'|'unknown')} datasetType - Which *kind* of dataset
+     *   loaded, taken verbatim from `dataset.datasetType`. **Not** "main" vs
+     *   "control", which this said until #471: that distinction is expressed by
+     *   which method is called -- `onMapLoaded` for the primary map,
+     *   `onControlMapLoaded` for the control map. See CONTEXT.md under
+     *   "Dataset" for the vocabulary, and `COORDINATOR_PAYLOAD_SHAPES` in
+     *   `js/publicApi.js`, which declares it as published contract.
+     */
+    onMapLoaded(dataset, state, datasetType) {
+        // 1. Initialize contact matrix view
+        if (!this.contactMatrixView.mouseHandlersEnabled) {
+            this.contactMatrixView.addTouchHandlers(this.contactMatrixView.viewportElement);
+            this.contactMatrixView.addMouseHandlers(this.contactMatrixView.viewportElement);
+            this.contactMatrixView.mouseHandlersEnabled = true;
+        }
+        this.contactMatrixView.clearImageCaches({thresholds: true});
+
+        // 2. Update chromosome selector
+        if (this.widgets.chromosomeSelector) {
+            this.widgets.chromosomeSelector.respondToDataLoadWithDataset(dataset);
+        }
+
+        // 3. Update rulers
+        if (this.rulers.x) {
+            this.rulers.x.wholeGenomeLayout(
+                this.rulers.x.axisElement,
+                this.rulers.x.wholeGenomeContainerElement,
+                this.rulers.x.axis,
+                dataset
+            );
+            this.rulers.x.update();
+        }
+        if (this.rulers.y) {
+            this.rulers.y.wholeGenomeLayout(
+                this.rulers.y.axisElement,
+                this.rulers.y.wholeGenomeContainerElement,
+                this.rulers.y.axis,
+                dataset
+            );
+            this.rulers.y.update();
+        }
+
+        // 4. The normalization widget is updated by onNormVectorIndexLoad,
+        // which the map-load path calls immediately after this. It had a
+        // MapLoad dispatch here that its handler never had a branch for.
+
+        // 5. Update resolution selector
+        if (this.widgets.resolutionSelector) {
+            // A new map voids the group's lock, not just this browser's.
+            // Reaches the peers because `clearDataset()` leaves this browser's
+            // own `synchedBrowsers` standing (#492). ADR-0014 decision 3.
+            this.browser.setResolutionLocked(false, {mirror: true});
+            this.widgets.resolutionSelector.updateResolutions(this.browser.state.zoom);
+        }
+
+        // 6. Update color scale widget
+        if (this.widgets.colorScaleWidget) {
+            this.widgets.colorScaleWidget.updateMapBackgroundColor(
+                this.browser.contactMatrixView.backgroundColor
+            );
+        }
+
+        // 7. Update control map widget
+        if (this.widgets.controlMapWidget && !this.browser.controlDataset) {
+            this.widgets.controlMapWidget.hide();
+        }
+
+        // 8. Notify external callbacks
+        for (const callback of this.externalCallbacks.onMapLoaded) {
+            callback({ dataset, state, datasetType, browser: this.browser });
+        }
+    }
+
+    /**
+     * Orchestrate component updates when a control map is loaded.
+     * 
+     * @param {Dataset} controlDataset - The loaded control dataset
+     */
+    onControlMapLoaded(controlDataset) {
+        if (this.widgets.controlMapWidget) {
+            this.widgets.controlMapWidget.updateDisplayMode(this.browser.getDisplayMode());
+            this.widgets.controlMapWidget.show();
+        }
+
+        if (this.widgets.resolutionSelector) {
+            this.widgets.resolutionSelector.updateResolutions(this.browser.state.zoom);
+        }
+
+        // ContactMatrixView also needs to know about control map
+        this.contactMatrixView.clearImageCaches({thresholds: true});
+
+        // Notify external callbacks
+        for (const callback of this.externalCallbacks.onControlMapLoaded) {
+            callback({ controlDataset, browser: this.browser });
+        }
+    }
+
+    /**
+     * Orchestrate component updates when the locus changes.
+     * 
+     * @param {Object} eventData - Event data containing state and change flags
+     * @param {State} eventData.state - The new state
+     * @param {boolean} eventData.resolutionChanged - Whether resolution changed
+     * @param {boolean} eventData.chrChanged - Whether chromosome changed
+     * @param {boolean} eventData.dragging - Whether currently dragging
+     */
+    onLocusChange(eventData) {
+        const { state, resolutionChanged, chrChanged } = eventData;
+
+        // 0. Retire a normalization substitution announcement that this view has
+        //    moved off. Asked of the view rather than of the change flags: the
+        //    announcement is raised from inside the same load that sets both
+        //    flags, so a flag-driven clear would take it down in the same breath
+        //    it went up (#372, ADR-0012 decision 2).
+        if (this.widgets.normalizationWidget) {
+            this.widgets.normalizationWidget.clearSubstitutionIfStale(state);
+        }
+
+        // 1. Update chromosome selector
+        if (this.widgets.chromosomeSelector) {
+            this.widgets.chromosomeSelector.respondToLocusChangeWithState(state);
+        }
+
+        // 2. Update scrollbar widget
+        if (this.widgets.scrollbar) {
+            this.widgets.scrollbar.updateForState(state);
+        }
+
+        // 3. Update resolution selector
+        if (this.widgets.resolutionSelector) {
+            if (resolutionChanged) {
+                // The resolution moved, so the lock is void everywhere. Safe on
+                // the sync hot path because a peer already unlocked is a
+                // no-op that stops there. ADR-0014 decision 3.
+                this.browser.setResolutionLocked(false, {mirror: true});
+            }
+            if (chrChanged !== false) {
+                const isWholeGenome = this.browser.dataset.isWholeGenome(state.chr1);
+                this.widgets.resolutionSelector.updateLabelForWholeGenome(isWholeGenome);
+                this.widgets.resolutionSelector.updateResolutions(state.zoom);
+            } else {
+                this.widgets.resolutionSelector.setSelectedResolution(state.zoom);
+            }
+        }
+
+        // 4. Update locus goto widget
+        if (this.widgets.locusGoto) {
+            this.widgets.locusGoto.updateForState(state);
+        }
+
+        // 5. Notify external callbacks
+        for (const callback of this.externalCallbacks.onLocusChange) {
+            callback({ state, changes: { resolutionChanged, chrChanged }, browser: this.browser });
+        }
+    }
+
+    /**
+     * Orchestrate component updates when normalization changes.
+     * 
+     * @param {string} normalization - The normalization type
+     */
+    onNormalizationChange(normalization) {
+        // The user has answered the question a standing announcement asked, so
+        // it is no longer true. The widget clears its own on a selector change;
+        // this is the same clear for a host that calls `setNormalization`
+        // directly, and it is idempotent.
+        if (this.widgets.normalizationWidget) {
+            this.widgets.normalizationWidget.clearSubstitution();
+        }
+        this.contactMatrixView.receiveEvent({ type: "NormalizationChange", data: normalization });
+        // NormalizationWidget updates via selector change, no direct notification needed
+    }
+
+    /**
+     * Orchestrate component updates when display mode changes.
+     * 
+     * @param {string} mode - The display mode ("A", "B", "AOB", "BOA", "AMB")
+     */
+    onDisplayMode(mode) {
+        if (this.widgets.colorScaleWidget) {
+            this.widgets.colorScaleWidget.updateForColorScale(
+                this.browser.contactMatrixView.getColorScale(mode)
+            );
+        }
+
+        if (this.widgets.controlMapWidget) {
+            this.widgets.controlMapWidget.updateDisplayMode(mode);
+        }
+    }
+
+    /**
+     * Orchestrate component updates when color scale changes.
+     * 
+     * @param {ColorScale|RatioColorScale} colorScale - The color scale instance
+     */
+    onColorScale(colorScale) {
+        if (this.widgets.colorScaleWidget) {
+            this.widgets.colorScaleWidget.updateForColorScale(colorScale);
+        }
+    }
+
+    /**
+     * Orchestrate component updates when 2D tracks are loaded.
+     * 
+     * @param {Array} tracks2D - Array of 2D track instances
+     */
+    onTrackLoad2D(tracks2D) {
+        this.contactMatrixView.receiveEvent({ type: "TrackLoad2D", data: tracks2D });
+    }
+
+    /**
+     * Orchestrate component updates when 2D track state changes.
+     * 
+     * @param {Object|Array} trackData - Track state data
+     */
+    onTrackState2D(trackData) {
+        this.contactMatrixView.receiveEvent({ type: "TrackState2D", data: trackData });
+    }
+
+    /**
+     * Orchestrate component updates when normalization vector index is loaded.
+     * 
+     * @param {Dataset} dataset - The dataset with loaded normalization vectors
+     */
+    onNormVectorIndexLoad(dataset) {
+        if (this.widgets.normalizationWidget) {
+            this.widgets.normalizationWidget.updateOptions();
+            this.widgets.normalizationWidget.stopNotReady();
+        }
+    }
+
+    /**
+     * Orchestrate the selector catching up with a normalization that has just
+     * been resolved.
+     *
+     * Distinct from `onNormalizationSubstituted`, which is the case where the
+     * answer differs from the request: that one also carries a reason and
+     * raises the marker. This is the quiet half -- the request survived, but the
+     * selector was built before the answer existed -- so it moves the selection
+     * and says nothing. Why the selector can be behind at all is written down
+     * once, at `NormalizationWidget.reselect` (#603).
+     *
+     * @param {string} normalization - the resolved normalization, as the state holds it
+     */
+    async onNormalizationResolved(normalization) {
+        if (this.widgets.normalizationWidget) {
+            await this.widgets.normalizationWidget.reselect(normalization);
+        }
+    }
+
+    /**
+     * Orchestrate component updates for normalization file load status.
+     * 
+     * @param {string} status - Load status ("start" or "stop")
+     */
+    onNormalizationFileLoad(status) {
+        if (this.widgets.normalizationWidget) {
+            if (status === "start") {
+                this.widgets.normalizationWidget.startNotReady();
+            } else {
+                this.widgets.normalizationWidget.stopNotReady();
+            }
+        }
+    }
+
+    /**
+     * Orchestrate component updates when a normalization was substituted -- the
+     * view is being drawn with something other than what was asked for.
+     *
+     * One path for both substitution moments (#372, ADR-0012): the restore-time
+     * coercion, whose scope is the whole file's option set, and the mid-render
+     * miss, whose scope is this chromosome and resolution. Both put the
+     * effective value on the selector and the reason beside it; neither raises a
+     * modal, because a link that opens correctly on `NONE` is not an error.
+     *
+     * There is no third caller. The hic-straw `alert` hook, which ADR-0012 first
+     * described as a read-failure surface, turns out to have exactly one caller
+     * in that library and it is this same event -- so it comes here too, through
+     * `dataLoader.#announceStrawSubstitution`, rather than to a modal.
+     *
+     * Uses a programmatic update method that prevents feedback loops by ensuring
+     * the change event listener doesn't trigger when we programmatically set the value.
+     *
+     * @param {string} normalization - The normalization actually being drawn
+     * @param {string} reason - What the user is told, from `substitutionReason`
+     */
+    onNormalizationSubstituted(normalization, reason) {
+        if (this.widgets.normalizationWidget) {
+            // Use programmatic update method to prevent feedback loop
+            this.widgets.normalizationWidget.setNormalizationProgrammatically(normalization);
+            if (this.browser.state) {
+                this.widgets.normalizationWidget.announceSubstitution(reason, this.browser.state);
+            }
+        }
+    }
+
+    /**
+     * Report that this browser did not follow a sibling panel, and why.
+     *
+     * A pure notification: nothing here changes what is drawn. Both refusals it
+     * carries are *correct* -- a map cannot be panned to a chromosome it does
+     * not contain, and two unrelated assemblies should not sync -- so there is
+     * nothing to repair. What was wrong until #626 is that both were silent, and
+     * a host watching two panels drift apart had no way to learn which of the
+     * two rules had fired, or that a rule had fired at all.
+     *
+     * Since #632 only the load-time refusal is emitted. Membership is settled
+     * when panels pair (ADR-0016), so a map missing a chromosome its peer
+     * carries never pairs in the first place, and the per-state refusal it used
+     * to produce is now a `console.error` assert in `HICBrowser.syncState`.
+     *
+     * The user-facing half is not here. Static membership is what made a panel
+     * surface affordable -- a mark that cannot flicker -- so since #637 the
+     * panel itself says it is isolated, with a mark the registry paints from
+     * `isolationReasons` (ADR-0016 decision 7). The load-time refusal reads the
+     * same rule and carries the mark's text as its `message`, so the host's log
+     * and the screen cannot disagree. The `console.warn` is the developer-facing
+     * half and the callback is the host-facing half.
+     *
+     * @param {Object} detail
+     * @param {string} detail.reason - `'no-compatible-peer'` or `'unresolved-chromosome'`.
+     *   `'unresolved-chromosome'` is no longer emitted since #632; it stays in the
+     *   union so host code that branches on it keeps compiling and running.
+     * @param {string} detail.message - The same thing in a sentence: since #637,
+     *   the isolation mark's tooltip on the refused panel, word for word.
+     */
+    onSyncRefused(detail) {
+        console.warn(`juicebox: panel not synced -- ${detail.message}`);
+        for (const callback of this.externalCallbacks.onSyncRefused) {
+            callback({ ...detail, browser: this.browser });
+        }
+    }
+
+    /**
+     * Tell the host where the crosshairs are: the locus under the pointer and
+     * the bp this panel is showing on each axis.
+     *
+     * A pure notification, called by the **source** alone (`CONTEXT.md`,
+     * *Crosshairs*) -- once per pointer move, and again when the view changes
+     * under a still pointer. A panel drawing an echo never calls it, so a host
+     * with one shared highlight hears one position (ADR-0020 decision 5).
+     * There is no separate "show": the first move after a hide is it.
+     *
+     * Only while the source shows a chromosome pair. In the whole-genome view
+     * the guides and the echo still draw but the host is told nothing, and a
+     * view change into it under a still pointer is an `onCrosshairsHide`.
+     *
+     * A callback that throws is logged and the rest still run: this is called
+     * from inside `update()` and teardown, which have work left to do.
+     *
+     * @param {Object} position
+     * @param {string} position.chr1 - chromosome on the x axis; never `All`
+     * @param {number} position.xBP
+     * @param {string} position.chr2 - chromosome on the y axis
+     * @param {number} position.yBP
+     * @param {{startXBP: number, endXBP: number, startYBP: number, endYBP: number}} position.extents -
+     *   the visible bp extent on each axis, along `chr1` and `chr2`
+     */
+    onCrosshairsMove(position) {
+        for (const callback of this.externalCallbacks.onCrosshairsMove) {
+            try {
+                callback(position);
+            } catch (error) {
+                console.error('Error in onCrosshairsMove callback:', error);
+            }
+        }
+    }
+
+    /**
+     * Tell the host the crosshairs are gone: Shift was released, or the pointer
+     * left every viewport -- or the source went to the whole-genome view, lost
+     * its map or was disposed with them showing. From the source alone, as `onCrosshairsMove` is.
+     */
+    onCrosshairsHide() {
+        for (const callback of this.externalCallbacks.onCrosshairsHide) {
+            try {
+                callback();
+            } catch (error) {
+                console.error('Error in onCrosshairsHide callback:', error);
+            }
+        }
+    }
+
+    /**
+     * Orchestrate component updates when colors change.
+     */
+    onColorChange() {
+        this.contactMatrixView.receiveEvent({ type: "ColorChange" });
+    }
+
+    /**
+     * Notify external callbacks when background color changes.
+     *
+     * @param {{r: number, g: number, b: number}} rgb - The new background color
+     */
+    onBackgroundColorChange(rgb) {
+        for (const callback of this.externalCallbacks.onBackgroundColorChange) {
+            callback({ rgb, browser: this.browser });
+        }
+    }
+
+    /**
+     * Notify external callbacks when foreground color changes.
+     *
+     * @param {{r: number, g: number, b: number}} rgb - The new foreground color
+     */
+    onForegroundColorChange(rgb) {
+        for (const callback of this.externalCallbacks.onForegroundColorChange) {
+            callback({ rgb, browser: this.browser });
+        }
+    }
+
+    /**
+     * Orchestrate component updates when contact map mouse position changes.
+     * Updates ruler highlighting based on mouse position.
+     * 
+     * @param {Object} xy - Mouse position coordinates
+     * @param {number} xy.x - X coordinate
+     * @param {number} xy.y - Y coordinate
+     */
+    onUpdateContactMapMousePosition(xy) {
+        // Update ruler highlighting for mouse position
+        this._updateRulerHighlightingForMousePosition(this.rulers.x, xy);
+        this._updateRulerHighlightingForMousePosition(this.rulers.y, xy);
+    }
+
+    /**
+     * Private helper: Update ruler highlighting for mouse position.
+     * 
+     * @param {Object} ruler - Ruler instance (x or y axis)
+     * @param {Object} xy - Mouse position coordinates
+     * @private
+     */
+    _updateRulerHighlightingForMousePosition(ruler, xy) {
+        if (!ruler || !ruler.bboxes) {
+            return;
+        }
+
+        ruler.unhighlightWholeChromosome();
+        const offset = ruler.axis === 'x' ? xy.x : xy.y;
+        const element = hitTestBbox(ruler.bboxes, offset);
+        if (element) {
+            element.classList.add('hic-whole-genome-chromosome-highlight');
+        }
+    }
+
+    /**
+     * Register an external callback for a specific event.
+     * 
+     * This provides a clear API for external applications (e.g., Spacewalk) to hook into
+     * browser events without needing to understand the internal event system.
+     * 
+     * @param {string} event - Event name ('onMapLoaded', 'onControlMapLoaded', 'onLocusChange', 'onGenomeChange')
+     * @param {Function} callback - Callback function to call when event occurs
+     * @returns {Function} - Unsubscribe function to remove the callback
+     * @throws {Error} - If event name is unknown
+     * 
+     * @example
+     * const unsubscribe = browser.coordinator.addCallback('onMapLoaded', (data) => {
+     *     console.log('Map loaded:', data.dataset.name);
+     * });
+     * // Later...
+     * unsubscribe();
+     */
+    addCallback(event, callback) {
+        if (!this.externalCallbacks[event]) {
+            throw new Error(
+                `Unknown event: ${event}. Available: ${Object.keys(this.externalCallbacks).join(', ')}`
+            );
+        }
+        this.externalCallbacks[event].push(callback);
+        return () => {
+            const index = this.externalCallbacks[event].indexOf(callback);
+            if (index > -1) {
+                this.externalCallbacks[event].splice(index, 1);
+            }
+        };
+    }
+
+    /**
+     * Orchestrate component updates when the genome changes.
+     * 
+     * This method is called when a new genome is loaded (e.g., when loading a Hi-C file
+     * with a different genome assembly). 
+     * 
+     * Note: Component updates (like chromosome selector) happen automatically when the
+     * dataset loads via onMapLoaded(), so we don't need to update them here. This method
+     * primarily exists to notify external callbacks (e.g., Spacewalk integration) so they
+     * can coordinate locus setting after a genome change.
+     *
+     * @param {string} genomeId - The ID of the new genome (e.g., "hg38", "mm10")
+     */
+    onGenomeChange(genomeId) {
+        this.externalCallbacks.onGenomeChange.forEach(callback => {
+            try {
+                callback({ genomeId });
+            } catch (error) {
+                console.error('Error in onGenomeChange callback:', error);
+            }
+        });
+    }
+}
+
+export default BrowserCoordinator;

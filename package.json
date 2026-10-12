@@ -1,10 +1,25 @@
 {
   "name": "juicebox.js",
-  "version": "2.2.1",
-  "main": "dist/juicebox.min.js",
-  "module": "dist/juicebox.esm.js",
+  "version": "4.9.0",
+  "type": "module",
+  "main": "./dist/juicebox.esm.js",
+  "module": "./dist/juicebox.esm.js",
+  "exports": {
+    ".": {
+      "import": "./dist/juicebox.esm.js",
+      "default": "./dist/juicebox.esm.js"
+    },
+    "./dist/juicebox.esm.js": "./dist/juicebox.esm.js",
+    "./dist/juicebox.min.js": "./dist/juicebox.min.js",
+    "./dist/css/juicebox.css": "./dist/css/juicebox.css",
+    "./dev-proxy/plugin": "./dev-proxy/plugin.js",
+    "./dev-proxy/map-url": "./dev-proxy/map-url.js",
+    "./test/data/wireFormatCorpus.js": "./test/data/wireFormatCorpus.js"
+  },
   "files": [
-    "dist/**"
+    "dist/**",
+    "dev-proxy/**",
+    "test/data/wireFormatCorpus.js"
   ],
   "author": {
     "name": "Jim Robinson"
@@ -15,12 +30,18 @@
     }
   ],
   "bugs": {
-    "url": "https://github.com/igvteam/juicebox.js/issues"
+    "url": "https://github.com/aidenlab/juicebox.js/issues"
   },
   "scripts": {
-    "build": "node scripts/updateVersion && npx rollup --config",
-    "test": "mocha -u tdd -r esm",
-    "prepack": "npm run build"
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "prepare": "npm run build",
+    "prepublishOnly": "npm run build",
+    "test": "vitest",
+    "test:ui": "vitest --ui",
+    "test:run": "vitest run",
+    "measure-consumers": "node scripts/measure-consumers.js"
   },
   "keywords": [
     "conformation capture",
@@ -30,30 +51,21 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/igvteam/juicebox.js.git"
+    "url": "git+https://github.com/aidenlab/juicebox.js.git"
   },
   "devDependencies": {
-    "@babel/preset-env": "^7.16.0",
-    "@rollup/plugin-babel": "^5.3.0",
-    "@rollup/plugin-commonjs": "^21.0.1",
-    "@rollup/plugin-node-resolve": "^13.0.6",
-    "@xmldom/xmldom": "^0.7.5",
+    "@vitest/ui": "^4.0.7",
     "atob": "^2.1.2",
     "btoa": "^1.2.1",
-    "chai": "^4.2.0",
-    "core-js": "^3.6.5",
-    "esm": "^3.2.25",
-    "finalhandler": "^1.1.2",
-    "fs-extra": "^8.1.0",
-    "hic-straw": "^2.0.4",
-    "igv-ui": "github:igvteam/igv-ui#44dd9d14",
-    "igv-utils": "github:igvteam/igv-utils#v1.2.10-jb",
-    "mocha": "^8.2.1",
-    "node-fetch": "^2.6.1",
-    "rollup": "^2.59.0",
-    "rollup-plugin-copy": "^3.4.0",
-    "rollup-plugin-strip": "^1.2.2",
-    "rollup-plugin-terser": "^7.0.2",
-    "w3c-xmlhttprequest": "^3.0.0"
+    "hic-straw": "github:aidenlab/hic-straw#v4.0.1",
+    "igv": "3.8.9",
+    "igv-ui": "github:igvteam/igv-ui#v1.5.9",
+    "igv-utils": "github:igvteam/igv-utils#v1.7.1",
+    "jsdom": "^29.1.1",
+    "sass": "^1.93.3",
+    "vite": "^8.0.0",
+    "vite-plugin-static-copy": "^4.0.0",
+    "vitest": "^4.0.7",
+    "w3c-xmlhttprequest": "^3.0.4"
   }
 }

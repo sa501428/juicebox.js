@@ -1,0 +1,478 @@
+/*
+ *  The MIT License (MIT)
+ *
+ * Copyright (c) 2016-2017 The Regents of the University of California
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
+ * associated documentation files (the "Software"), to deal in the Software without restriction, including
+ * without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the
+ * following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all copies or substantial
+ * portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING
+ * BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,  FITNESS FOR A PARTICULAR PURPOSE AND
+ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+ * CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+
+/**
+ * The declared public surface of juicebox.js.
+ *
+ * juicebox.js is an embeddable component, not an application. Its correctness
+ * condition is not "the dev harness still works" -- it is "the host apps still
+ * work, and so does an embedder we have never heard of."
+ *
+ * Most of that surface is not visible from inside this repo. `js/index.js`
+ * exports twelve names and `HICBrowser` is not one of them: hosts get browser
+ * instances from `init()` and then use them directly. So asking "does anything
+ * call this?" and grepping `js/` returns *no* for members two shipped
+ * applications depend on. Every refactor that trusts that grep is reasoning
+ * from a false negative -- and one already has, see ADR-0003.
+ *
+ * This module is the fix. It names the surface as data so there is somewhere to
+ * look, and `test/testPublicApi.js` reads it so there is something that breaks.
+ *
+ * **A name in this file is a promise.** Renaming it, removing it, or changing
+ * its signature or return type is a breaking change requiring a coordinated
+ * release across both known consumers -- see the release ceremony.
+ *
+ * **Absence from this file is not permission.** juicebox.js is MIT, published
+ * and embeddable by anyone; the consumers we can measure are not the
+ * population. For anything resembling a load, a session, a state or a
+ * lifecycle call, prefer deprecation over deletion even when this file is
+ * silent. For genuinely internal machinery, this file is sufficient.
+ *
+ * Nothing imports this module at runtime, so it never reaches a consumer
+ * bundle. It is not in `package.json`'s `files` either -- this is repo source,
+ * read here or on GitHub, not something an installed package exposes.
+ */
+
+/**
+ * Names exported from `js/index.js`.
+ *
+ * This half of the contract is healthy: it is declared in an explicit export
+ * block and used roughly as intended. It is listed here so the whole surface
+ * sits in one place, and so the test can check both directions -- an addition
+ * here is as much a contract change as a removal.
+ */
+export const NAMESPACE_SURFACE = [
+    'version',
+    'init',
+    // The registry's front door, new in #483. `init` is a wrapper over it and
+    // keeps its own return type, so this is an addition to the surface rather
+    // than a change to it. Decision 3 of ADR-0004.
+    'initRegistry',
+    'toJSON',
+    'restoreSession',
+    'compressedSession',
+    'createBrowser',
+    'getCurrentBrowser',
+    'setCurrentBrowser',
+    'getAllBrowsers',
+    'igvxhr',
+    'EventBus',
+    'setUrlMapper',
+    // The rule juicebox derives a track's or map's filename by, so a host need
+    // not keep its own copy of it. juicebox-web pairs a BAM with its index by
+    // it. #698.
+    'filenameFromUrl'
+]
+
+/**
+ * Browser instance members that exist as soon as a browser is constructed.
+ *
+ * This is the undeclared half of the contract, and the reason this file exists.
+ * `HICBrowser` is not exported; hosts receive instances from `init()`,
+ * `createBrowser()` or `getCurrentBrowser()` and use them directly.
+ *
+ * Five of these -- the four load methods and `parseGotoInput` -- forward to an
+ * internal collaborator without adding behaviour, and four of those have no
+ * internal callers at all: they exist solely for hosts. They look like
+ * deletable indirection from inside this repo and are not. Removing them would
+ * not remove a hop, it would promote the collaborators they delegate to from
+ * internal detail to published name, freezing this decomposition into the
+ * contract. See #467.
+ *
+ * Seven more are assigned in the constructor rather than declared on the
+ * prototype, so they are invisible to any check that reflects on the class
+ * instead of building an instance.
+ *
+ * Deliberately *not* declared, and new in #637: `isolationMark`, the navbar
+ * element, and `setIsolationReason`, which the registry calls to paint it after
+ * recomputing membership. The mark is library chrome and needs no host
+ * (ADR-0016 decision 9); a host that wants the reason has `onSyncRefused`,
+ * whose `message` is the same text. Nor is `dataset.missingChromosomes`, the
+ * lookup behind the mark's coverage wording, although `dataset` is declared.
+ *
+ * Nor, new in #679, `loadHicFileOrThrow` and `loadHicControlFileOrThrow`: the
+ * two map loaders without their alerts, the way `loadTracksOrThrow` is
+ * `loadTracks` without its own, and to be reached only from the target-set fan-out.
+ * Absence from this file is not permission, and naming them here is what makes
+ * that decision visible.
+ *
+ * Nor, new in #708, `moveCrosshairs`, `releaseCrosshairs` and `echoCrosshairs`:
+ * the first two are how the viewport carries out a crosshairs intent, and the
+ * third is what a source calls on its sync-group peers. A host places nothing;
+ * it hears where the source's pointer is (ADR-0020 decision 5) -- since #709
+ * through `onCrosshairsMove`, which replaced the browser's short-lived
+ * `notifyCrosshairsHost` before that name was ever released.
+ */
+export const BROWSER_SURFACE = [
+    // Delegating loaders and lookups -- no internal callers, hosts only
+    'loadHicFile',
+    'loadTracks',
+    'loadHicControlFile',
+    'loadLiveContactMap',
+    'parseGotoInput',
+
+    // Real methods
+    'reset',
+    // Deprecated in #709 -- see DEPRECATED_SURFACE.
+    'setCustomCrosshairsHandler',
+    // The one teardown path, new in #493. Declared deliberately rather than
+    // left to be discovered: Spacewalk tears down its Juicebox panel and has no
+    // way to say so today, and per "absence is not permission" a new reachable
+    // member is contract the moment it ships. Decision 7 of ADR-0005.
+    //
+    // It is also the one member whose *effect* on the rest of this list is
+    // contract: after it, every other method here throws a
+    // `DisposedBrowserError` rather than quietly doing nothing. Decision 6.
+    'dispose',
+
+    // Accessors -- present from construction, populated by a load.
+    //
+    // `dataset`/`state` is the canonical vocabulary; `activeDataset` and
+    // `activeState` are aliases for the same two accessors, and no internal
+    // code reads either. `activeDataset` is here because Spacewalk reads it.
+    // `state` and `activeState` have no measured reader in either host -- they
+    // are declared because we have decided to keep them, and this file is where
+    // that decision has to be visible, per "absence is not permission" above.
+    // See #468.
+    'dataset',
+    'activeDataset',
+    'state',
+    'activeState',
+
+    // Constructor-assigned fields
+    'id',
+    'config',
+    // The registry owning this browser's embed. Declared deliberately rather
+    // than acquired by accident: `setCurrentBrowser(browser)` resolves through
+    // it, so it is load-bearing from the moment it ships, and it is the route a
+    // multi-embed host takes when the page-wide getters are the wrong question.
+    // Decision 9 of ADR-0004, #479.
+    'registry',
+    'rootElement',
+    'eventBus',
+    'coordinator',
+    'layoutController',
+    'contactMatrixView'
+]
+
+/**
+ * Members of the `BrowserRegistry` a host is handed.
+ *
+ * A host reaches a registry two ways, both declared surface: `initRegistry()`
+ * returns one, and `browser.registry` is one. Per "absence is not permission"
+ * above, everything reachable on that object becomes contract the moment it
+ * ships -- so the set is chosen here deliberately rather than being whatever
+ * the class happens to expose. Decisions 3 and 9 of ADR-0004, #483.
+ *
+ * This is the multi-embed answer to the page-wide getters: a host with two
+ * embeds asks a registry what its browsers are and which one is current,
+ * instead of asking `getAllBrowsers()` page-wide and getting whichever embed
+ * the user touched last.
+ *
+ * Deliberately *not* declared, and internal: `register`, `clear` and
+ * `refreshDeleteButtonVisibility`, which are steps of the initialization path
+ * -- a browser is registered before it is initialized, and visibility is
+ * settled once -- and mean nothing to a caller outside it; and `alertDialog`,
+ * which is the lazily built igv-ui dialog behind `presentAlert`. A host raises
+ * an alert; which widget the registry does it with is ours to change.
+ *
+ * Also deliberately not declared, and new in #615: `retarget`, which is the
+ * plain-click gesture (a host that wants its effect calls `select`, and the
+ * clear that goes with it is the *user's* re-aim, not an API operation);
+ * `isTargetedExplicitly`, which exists so `HICBrowser.reset` can carry
+ * membership across its own teardown, as `releaseSlot` and `reclaimSlot`
+ * already carry the slot; and the browser's own `loadTracksOrThrow`, which is
+ * `loadTracks` without the alert and is what the fan-out is built on. A host
+ * that wants a rejecting load should be given a declared name for it rather
+ * than finding this one -- absence from this file is not permission, and
+ * naming them here is what makes that decision visible.
+ */
+export const REGISTRY_SURFACE = [
+    // The element this registry owns, which is what it is keyed by.
+    'container',
+
+    // The embed's browsers and which of them is current. The invariant is
+    // decision 7's: a non-empty registry has a current browser.
+    'browsers',
+    'currentBrowser',
+
+    // Per embed rather than page-wide because it is serialized per session.
+    'selectedGene',
+
+    // Lifecycle. `add` and `delete` are the registry-scoped counterparts of the
+    // exported `createBrowser` and `setCurrentBrowser`.
+    'add',
+    'select',
+    'delete',
+    'deleteAll',
+    'updateAll',
+    // The embed-level teardown, new in #496, and the counterpart of
+    // `initRegistry` the way `browser.dispose` is the counterpart of the
+    // constructor. Declared for the same reason that one is. Decisions 7 and 8
+    // of ADR-0005.
+    'dispose',
+
+    // The sync group's membership rule, over this registry's browsers by
+    // default. Decision 6.
+    'sync',
+
+    // The target set, new in #615: which browsers a *load* reaches, the one
+    // gesture that changes it, and the fan-out itself. A different mechanism
+    // from the sync group, with different membership and different cargo --
+    // ADR-0015. Declared rather than discovered because a host is what calls
+    // the fan-out: the track menu that issues one lives in juicebox-web.
+    //
+    // Nothing existing became plural to get here. `currentBrowser`,
+    // `BrowserSelect` and `HICBrowser.loadTracks` mean exactly what they meant
+    // before; a host opts in by calling the new method.
+    'targetedBrowsers',
+    'toggleTarget',
+    // Resolves to `{loaded, failed, skipped}`. The two skip reasons --
+    // `'no-dataset'` and `'genome-mismatch'` -- are as much contract as the
+    // field names: a host branching on a third spelling nobody declared is
+    // exactly the failure #471 was. They are defined in `js/targetGroup.js` and
+    // pinned by `test/testTargetGroup.js`.
+    'loadTracksIntoTargets',
+    // Resolves to `{loaded, failed, skipped}` -- with their track meanings, so
+    // one code path reads both summaries, though `skipped` is always empty: a
+    // map carries its own genome, so nothing is skipped. A panel whose genome
+    // the map replaces loses its tracks (#682, ADR-0019). Serial, not
+    // concurrent. #680.
+    'loadHicFileIntoTargets',
+    // The same three keys. `skipped` reasons are `'no-primary'` (the panel has no
+    // "A" map) and `'control-incompatible'` (its "A" map cannot pair with this
+    // "B" one, known only after the read) -- contract, like the track reasons,
+    // and defined and pinned in the same two files. Serial. #681.
+    'loadHicControlFileIntoTargets',
+
+    // A session describes one embed; these are where one is actually written
+    // and read. The exported `toJSON`/`restoreSession` delegate here.
+    'toJSON',
+    'restoreSession',
+
+    // This embed's own alert dialog, rather than igv-ui's page-wide singleton.
+    'presentAlert'
+]
+
+/**
+ * Surface that does not exist until a map has loaded.
+ *
+ * These are contract exactly like `BROWSER_SURFACE`, but they cannot be
+ * asserted against a freshly constructed browser: nothing assigns them until a
+ * dataset arrives. `genome`, for instance, is set by the data loader, and
+ * Spacewalk guards on its presence.
+ *
+ * They are declared separately rather than dropped, because the whole failure
+ * this file addresses is that undeclared surface is invisible surface. A member
+ * that is hard to test is not thereby less of a promise.
+ *
+ * Each entry names the path a host reads and where it is populated.
+ */
+export const POST_LOAD_SURFACE = [
+    {path: 'browser.genome', populatedBy: 'dataLoader, on map load'},
+    {path: 'browser.dataset.isLive', populatedBy: 'the Dataset constructor'},
+    {path: 'browser.activeDataset.isLive', populatedBy: 'the Dataset constructor'}
+]
+
+/**
+ * Contract reached one dot further out, through a member of `BROWSER_SURFACE`.
+ *
+ * These are the easiest part of the surface to miss, because nothing about them
+ * looks public from the browser's own member list: a host that holds
+ * `browser.layoutController` can call anything on it, and two do. Handing back
+ * an internal collaborator publishes the parts of it that get used.
+ *
+ * `owner` is the browser member the host reaches through; `member` is what it
+ * uses on the far side.
+ */
+export const SUB_SURFACES = [
+    {owner: 'layoutController', member: 'removeTrackXYPair'},
+    {owner: 'layoutController', member: 'getContactMatrixViewport'},
+    {owner: 'contactMatrixView', member: 'update'},
+    {owner: 'contactMatrixView', member: 'ctx'},
+    // Spacewalk sizes its live-map view from this element. Missing from
+    // ADR-0003's measurement and found while reviewing #470 -- which is the
+    // point: a hand-measured table missed it, and a test would not have.
+    {owner: 'contactMatrixView', member: 'viewportElement'},
+    {owner: 'coordinator', member: 'addCallback'},
+    // Spacewalk subscribes DidHideCrosshairs on the per-browser bus -- an event
+    // deprecated in #709, though the bus itself is not. Nothing in
+    // this repo subscribes to either bus any more -- the coordinator is the
+    // internal route -- so these three are read only from outside. unsubscribe
+    // is new in #414: a host holding a handler on a browser it later discards
+    // had no way to let go.
+    {owner: 'eventBus', member: 'subscribe'},
+    {owner: 'eventBus', member: 'unsubscribe'},
+    {owner: 'eventBus', member: 'post'}
+]
+
+/**
+ * Event names accepted by `browser.coordinator.addCallback(name, fn)`.
+ *
+ * This is the host extension point -- how an embedder learns about map loads,
+ * locus changes and colour changes without subscribing to the event bus. See
+ * ADR-0002 for why the coordinator is not going away.
+ *
+ * All of them are declared, not just the ones a known consumer happens to use
+ * today: `addCallback` throws on an unrecognised name, so the set it accepts is
+ * already published behaviour. Narrowing it would break a host that registered
+ * one of the others, silently and only at runtime.
+ *
+ * The coordinator got here on its own -- it validates against its own declared
+ * list and throws. That is the only self-describing, self-enforcing piece of
+ * the browser contract, and it is the pattern this whole module generalises.
+ */
+export const COORDINATOR_CALLBACKS = [
+    'onMapLoaded',
+    'onControlMapLoaded',
+    'onLocusChange',
+    'onGenomeChange',
+    'onBackgroundColorChange',
+    'onForegroundColorChange',
+    'onSyncRefused',
+    // The crosshairs, new in #709: where the source's pointer is, and that it
+    // has gone. Once per pointer move, from the source only, never from an
+    // echo -- and again when the view changes under a still pointer. There is
+    // no "show": the first move after a hide is it. Silent in the whole-genome
+    // view, where the guides still draw. ADR-0020 decision 5.
+    'onCrosshairsMove',
+    'onCrosshairsHide'
+]
+
+/**
+ * Callback payload internals a host reads into, and the values a field may hold.
+ *
+ * The manifest declares *names*; #471 was a case where the name was fine and the
+ * **meaning** was wrong. `onMapLoaded`'s `datasetType` was documented as
+ * "main" / "control" -- a vocabulary the code never spoke -- while it actually
+ * carried `'live' | 'hic' | 'unknown'`, and the live loader published a fourth
+ * spelling, `'livecontactmap'`, of its own. Nothing here or anywhere else said
+ * otherwise, so a host branching on the documented values would have written a
+ * branch that silently never fired.
+ *
+ * A declared `values` list is what a name alone could not carry. Adding a value
+ * is a change to what hosts must handle; it is caught here rather than in a
+ * JSDoc nobody diffs.
+ *
+ * Declaration only, in the same sense as EVENT_PAYLOAD_SHAPES -- what the
+ * coordinator actually delivers is exercised in
+ * `test/testMapLoadedPayload.js`, which drives both load paths.
+ */
+export const COORDINATOR_PAYLOAD_SHAPES = [
+    {
+        callback: 'onMapLoaded',
+        payload: ['dataset', 'state', 'datasetType', 'browser'],
+        values: {datasetType: ['live', 'hic', 'unknown']},
+        readsInto: ['dataset', 'dataset.isLive']
+    },
+    {
+        callback: 'onControlMapLoaded',
+        payload: ['controlDataset', 'browser']
+    },
+    // `chr1` and `chr2` are chromosome *names*, and never `All`: the host is not
+    // told in the whole-genome view. `extents` is the visible bp on each axis,
+    // along those two chromosomes, which is what replaces the old handler's viewport-fraction
+    // interpolants. `onCrosshairsHide` is called with nothing. Delivery is
+    // driven in `test/testCrosshairsHostCallbacks.js`.
+    {
+        callback: 'onCrosshairsMove',
+        payload: ['chr1', 'xBP', 'chr2', 'yBP', 'extents'],
+        readsInto: ['extents.startXBP', 'extents.endXBP', 'extents.startYBP', 'extents.endYBP']
+    }
+]
+
+/**
+ * Declared surface that is on its way out.
+ *
+ * A deprecated name is still a promise: it stays in the list it was declared
+ * in, keeps working, and is removed only in the release named here. This list
+ * is what stops a deprecation quietly becoming a deletion -- the test checks
+ * each entry is still declared where `declaredIn` says, and that what replaces
+ * it is declared too.
+ *
+ * All three are the old crosshairs surface, and since #709 shims over the two
+ * coordinator callbacks: each fires where its replacement does, so each is
+ * source-only. That narrowed two of them. `DidHideCrosshairs` used to be posted
+ * by every panel on the page for any key release, shown or not; and
+ * `DidShowCrosshairs` used to be posted when Shift went down, before there was
+ * a position to show. ADR-0020 decision 6.
+ */
+export const DEPRECATED_SURFACE = [
+    {name: 'setCustomCrosshairsHandler', declaredIn: 'BROWSER_SURFACE', replacedBy: 'onCrosshairsMove', removeIn: '5.0'},
+    {name: 'DidShowCrosshairs', declaredIn: 'EVENTS_POSTED', replacedBy: 'onCrosshairsMove', removeIn: '5.0'},
+    {name: 'DidHideCrosshairs', declaredIn: 'EVENTS_POSTED', replacedBy: 'onCrosshairsHide', removeIn: '5.0'}
+]
+
+/**
+ * Events juicebox.js posts, and the bus each travels on.
+ *
+ * The event bus is the sharpest case in the whole contract. Every internal
+ * subscription was migrated to the coordinator, so from inside this repo the
+ * bus looks dead -- and from outside it is load-bearing: five of these have
+ * external subscribers and no internal ones. A review that counted subscribers
+ * by grepping `js/` concluded the per-browser bus had none, which was true of
+ * this repo and false of the product.
+ *
+ * **These names are declared but not enforced.** The test asserts the plumbing
+ * they travel over, not that each is still posted -- proving an event still
+ * fires means driving a real map load and watching the bus, which needs the
+ * probe harness of #438.
+ *
+ * That is a real gap, and it is worth naming precisely: juicebox-web subscribed
+ * to a `MapLoad` event that stopped being posted in December 2025 and nobody
+ * noticed for eight months. Nothing in this file would catch that happening
+ * again. Removing a name here is caught by review; removing the *post* that
+ * feeds it is not.
+ */
+export const EVENTS_POSTED = [
+    {name: 'GenomeChange', bus: 'global'},
+    {name: 'BrowserSelect', bus: 'global'},
+    {name: 'BrowserTargetChange', bus: 'global'},
+    {name: 'TrackXYPairLoad', bus: 'global'},
+    {name: 'TrackXYPairRemoval', bus: 'global'},
+    // Both deprecated in #709 -- see DEPRECATED_SURFACE.
+    {name: 'DidHideCrosshairs', bus: 'browser'},
+    {name: 'DidShowCrosshairs', bus: 'browser'},
+    {name: 'DragStopped', bus: 'browser'}
+]
+
+/**
+ * Event payload shape that a host reads into.
+ *
+ * `TrackXYPairLoad` and `TrackXYPairRemoval` carry the track pair itself.
+ * juicebox-web reads the track and its config format off the payload, then
+ * hands the same object back to `layoutController.removeTrackXYPair`. So the
+ * payload's internals are published shape, not an implementation detail -- a
+ * refactor that changed what a track pair looks like would break a host that
+ * never named the type.
+ *
+ * Declaration only; verifying it means posting a real track load.
+ */
+export const EVENT_PAYLOAD_SHAPES = [
+    // Plural name because the subject is a set, unlike `BrowserSelect`, whose
+    // payload is the one browser. It carries the *resolved* array so a host
+    // need not re-derive the implicit-current rule, and the registry because
+    // the bus is page-wide while a target set is per embed. #615.
+    {event: 'BrowserTargetChange', payload: '{registry, targetedBrowsers}', readsInto: ['registry', 'targetedBrowsers']},
+    {event: 'TrackXYPairLoad', payload: 'the TrackPair itself', readsInto: ['track', 'track.name', 'track.config.format']},
+    {event: 'TrackXYPairRemoval', payload: 'the TrackPair itself', readsInto: ['track', 'track.name', 'track.config.format']}
+]

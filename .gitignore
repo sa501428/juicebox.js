@@ -6,11 +6,10 @@ node_modules
 /.idea
 *.js.iml
 /website/juiceboxConfig-private.js
-/dist/
 /dev/breakfinder.html
 /dev/six-panel.html
 /dev/mb275.html
 /dev/private/
 /dev/Figure_S20_geo.json
 /dev/issue_360.html
-/package-lock.json
+dist/

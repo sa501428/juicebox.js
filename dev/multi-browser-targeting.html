@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8"/>
+    <title>Multi-browser targeting — one load, several panels</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+
+    <link rel="stylesheet" href="//maxcdn.bootstrapcdn.com/font-awesome/4.2.0/css/font-awesome.min.css">
+    <link rel="stylesheet" type="text/css" href="../css/juicebox.css">
+
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+            margin: 16px;
+        }
+
+        .controls {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            align-items: center;
+            margin-bottom: 12px;
+        }
+
+        .summary {
+            font-family: Menlo, Consolas, monospace;
+            font-size: 12px;
+            white-space: pre-wrap;
+            background: #f4f4f4;
+            border: 1px solid #ddd;
+            padding: 8px;
+            min-height: 3em;
+        }
+
+        .aim {
+            font-family: Menlo, Consolas, monospace;
+            font-size: 12px;
+            margin: 8px 0;
+        }
+
+        #panels {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px;
+        }
+
+        .note {
+            max-width: 62em;
+            font-size: 13px;
+            color: #333;
+        }
+    </style>
+</head>
+
+<body>
+
+<h2>Multi-browser targeting (#615)</h2>
+
+<p class="note">
+    <b>Shift-click a panel's navbar</b> to put it in the target set; <b>plain-click</b>
+    a navbar to clear the set and make that panel current. The current panel is always
+    targeted, so with nothing shift-clicked a load behaves exactly as it does today.
+    Dark solid border = current, no aim; blue solid border = the first shift-click,
+    which is both current and the head of the aim; blue dashed outline = aimed at.
+</p>
+
+<p class="note">
+    <b>Go to annotations</b> navigates to where the loaded 2D features actually are,
+    computed from <code>browser.tracks2D</code> — repeated clicks cycle the chromosome
+    pairs. The fixture's loops are motif-resolution anchors, tens of bp wide, so they
+    draw at the one-pixel floor: small marks on the diagonal, not blocks.
+</p>
+
+<p class="note">
+    The <b>first</b> shift-click of a new aim also makes that panel current. The load is
+    issued from the current panel, and it is that panel's genome the skips below are
+    measured against — so the aim line names its origin. Aim from the mm10 panel and the
+    hg38 panels are the ones skipped.
+</p>
+
+<p class="note">
+    <b>Every panel starts empty.</b> Aim at some panels and load a map into them; the
+    panels you leave out stay empty. The <b>skip</b> paths are the parts most likely to
+    be silently wrong, so set them up on purpose: leave one panel with <b>no map</b>,
+    put <b>mm10</b> in another, then aim at everything and load the hg38 tracks. The
+    summary must report those two as skipped — not as loaded, and not as an error.
+</p>
+
+<p class="note">
+    The <b>map</b> buttons load one <code>.hic</code> map into every aimed panel
+    (#680) — through <code>registry.loadHicFileIntoTargets</code>. The rules are not the
+    track rules: a map carries its own genome, so nothing is skipped, an empty panel
+    takes it like any other, and the loads run <b>one after another</b>. A panel whose
+    genome the map replaces loses its tracks, pending ones and 2D annotations included,
+    exactly as a single-panel load does (#682).
+</p>
+
+<p class="note">
+    The <b>control</b> button loads one hg38 <code>.hic</code> map as the
+    <b>"B"</b> map of every aimed panel (#681) — through
+    <code>registry.loadHicControlFileIntoTargets</code>. This one <em>does</em> skip, and
+    both skips can be seen: an empty panel is skipped <code>[no-primary]</code> —
+    nothing to be the "B" of — and an mm10 panel is skipped
+    <code>[control-incompatible]</code>, known only after its read. Neither raises a
+    modal. Each panel's A/B/ratio choice is left where the control load leaves it.
+</p>
+
+<div class="controls">
+    <button id="add-browser">Add browser (hg38)</button>
+    <button id="map-hg38">Load hg38 map into targets</button>
+    <button id="map-mm10">Load mm10 map into targets</button>
+    <button id="control-hg38">Load hg38 control map into targets</button>
+    <button id="load-1d">Load 1D track into targets</button>
+    <button id="load-2d">Load 2D annotation into targets</button>
+    <button id="load-both">Load both into targets</button>
+    <button id="goto-2d">Go to annotations</button>
+</div>
+
+<div class="aim" id="aim">aim: —</div>
+
+<div class="aim" id="roster">panels: —</div>
+
+<div class="summary" id="summary">No load yet.</div>
+
+<div id="panels"></div>
+
+<script type="module">
+
+    import hic from '../js/index.js'
+    import EventBus from '../js/eventBus.js'
+
+    // Page styles that must land after the library's. Importing js/index.js injects
+    // juicebox.scss at the end of <head>, so rules in the <style> above lose to it on
+    // source order; these are appended once the imports have run.
+    //
+    // - The badges the registry drives, exaggerated so the four states -- plainly
+    //   selected, the anchor of an aim, aimed at, neither -- are obvious at a glance.
+    //   The library qualifies its badges with .hic-root, so this does too.
+    // - A hostile host (#625): juicebox-web's app.scss redeclared .hic-root-selected
+    //   after juicebox.css. The anchor must stay blue anyway; if it turns grey, the
+    //   badge is winning on source order again.
+    const pageStyles = document.createElement('style')
+    pageStyles.textContent = `
+        .hic-root.hic-root-targeted {
+            outline: 4px dashed #3a8ab4;
+            outline-offset: -4px;
+        }
+
+        .hic-root-selected {
+            border-color: #5f5f5f;
+        }
+    `
+    document.head.appendChild(pageStyles)
+
+    // Verified reachable from a browser. Do NOT repoint these at
+    // hicfiles.s3.amazonaws.com or dnazoo -- those hosts gate on User-Agent and serve
+    // 403 to any browser. See the note in dev/big_viewport.html.
+    const hg38Maps = [
+        {
+            url: 'https://s3.us-east-1.wasabisys.com/aiden-suhas/hic_files/FINAL_GRCh38_processing/LCL/GM12878/diploid/r.hic',
+            name: 'GM12878 diploid (r) — hg38',
+            nvi: '43762184328,25419'
+        },
+        {
+            url: 'https://s3.us-east-1.wasabisys.com/aiden-suhas/hic_files/FINAL_GRCh38_processing/LCL/GM12878/diploid/a.hic',
+            name: 'GM12878 diploid (a) — hg38',
+            nvi: '43835341324,25419'
+        }
+    ]
+
+    // The two primary maps: one per genome, so panels on different genomes can sit
+    // side by side. Both hosts answer a browser directly -- the 4DN bucket serves
+    // `Access-Control-Allow-Origin: *` and no User-Agent gate, measured 2026-09-18 --
+    // so neither needs the dev proxy.
+    const primaryMaps = {
+        hg38: hg38Maps[0],
+        mm10: {
+            url: 'https://4dn-open-data-public.s3.amazonaws.com/fourfront-webprod/wfoutput/3a7bfc55-8582-498a-946a-300000f25f48/4DNFIFDYZOYP.hic',
+            name: '4DNFIFDYZOYP lung — mm10'
+        }
+    }
+
+    // The control map. hg38, so it pairs with a panel holding the hg38 primary and is
+    // refused by one holding the mm10 primary.
+    const controlMap = {...hg38Maps[1], name: 'GM12878 diploid (a) as control — hg38'}
+
+    // hg38, and `format` is set deliberately: a format-less URL ending in .txt.gz is
+    // routed to the 2D loader, so an annotation that says nothing about itself would
+    // arrive as a broken 2D track rather than as genes. See js/dataLoader.js.
+    const track1D = {
+        url: 'https://s3.amazonaws.com/igv.org.genomes/hg38/refGene.sorted.txt.gz',
+        type: 'annotation',
+        format: 'refgene',
+        name: 'RefSeq Genes (hg38)',
+        color: '#1f77b4'
+    }
+
+    const track2D = {
+        url: 'https://www.dropbox.com/scl/fi/mweycro8eyhubrjrhv6oo/fosl1_loops_with_snps_nothresh.bedpe?rlkey=1dv8wbc7c57m9muob7tlxvm89&e=1&st=2c4adj56&dl=0',
+        name: 'fosl1 loops (hg38)',
+        color: '#00fdff',
+        displayMode: 'COLLAPSED'
+    }
+
+    const panels = document.getElementById('panels')
+    const summaryElement = document.getElementById('summary')
+    const aimElement = document.getElementById('aim')
+    const rosterElement = document.getElementById('roster')
+
+    // What each panel was built to be, so a map that fails to load is *visible*
+    // rather than quietly degrading into the no-dataset skip. That degradation is
+    // the failure mode this page is least able to afford: it would collapse the two
+    // skip paths into one and leave the genome rule untested while looking fine.
+    const built = []
+
+    // The dataset's name rather than `browser.config`'s: a map load replaces the
+    // dataset but not the config the panel was built from. Numbered, because after a
+    // load several panels carry the same map and the name alone cannot tell them
+    // apart.
+    const label = browser => {
+        const n = built.findIndex(entry => entry.browser === browser) + 1
+        return `#${n} ` + (browser.dataset ? (browser.dataset.name || browser.id) : `${browser.id} (no map)`)
+    }
+
+    // One container, and therefore **one registry**: a target set never spans two
+    // embeds -- it falls out of the per-container isolation of ADR-0004, and a fan-out
+    // is issued *through* a registry, so a set spanning two would have no caller. Every
+    // panel here is a browser in the same registry, which is the shape juicebox-web has
+    // when a user adds a second map.
+    let registry
+
+    // The contact map's size, not the panel's: the panel is this plus its chrome.
+    const mapSize = {width: 400, height: 400}
+
+    const panelCount = 5
+
+    async function addPanel(config, expectedGenome) {
+        const browser = undefined === registry
+            ? await hic.init(panels, {...config, ...mapSize})
+            : await hic.createBrowser(panels, {...config, ...mapSize})
+        built.push({browser, expectedGenome})
+        return browser
+    }
+
+    function renderRoster() {
+        rosterElement.textContent = 'panels: ' + built
+            .map(({browser, expectedGenome}) => {
+                const actual = browser.genome?.id ?? 'no map'
+                const wrong = (expectedGenome ?? 'no map') !== actual
+                return `${label(browser)} = ${actual}${wrong ? ` ⚠ expected ${expectedGenome ?? 'no map'}` : ''}`
+            })
+            .join(' | ')
+    }
+
+    function renderAim() {
+        // The event fires while the first panel is still being built, before
+        // there is a registry to ask.
+        if (undefined === registry) {
+            return
+        }
+        // The origin is named, not just the members: it is the current browser,
+        // and it is the genome every skip is measured against. An aim whose
+        // origin you cannot see is one whose skips look inexplicable.
+        const origin = registry.currentBrowser
+        aimElement.textContent = `aim: ${registry.targetedBrowsers.map(label).join(', ') || '—'}`
+            + `   (from ${origin ? label(origin) : '—'}, genome ${origin?.genome?.id ?? 'none'})`
+    }
+
+    function renderSummary(summary) {
+        const line = what => what.length ? what.join(', ') : '—'
+        summaryElement.textContent = [
+            `loaded:  ${line(summary.loaded.map(label))}`,
+            `skipped: ${line(summary.skipped.map(({browser, reason}) => `${label(browser)} [${reason}]`))}`,
+            `failed:  ${line(summary.failed.map(({browser, error}) => `${label(browser)}: ${error.message}`))}`
+        ].join('\n')
+    }
+
+    // juicebox.js raises no alert for a fan-out: it returns the summary and the caller
+    // reports. One report per gesture, not one modal per browser -- and where it appears
+    // is the host's decision. This page's decision is the line above the panels.
+    async function fanOut(configs) {
+        summaryElement.textContent = 'loading…'
+        renderSummary(await registry.loadTracksIntoTargets(configs))
+    }
+
+    // A map load changes what each loaded panel *is*, so the roster's expectations
+    // move with it -- otherwise every panel the map reached would read as wrong.
+    async function loadMap(genomeId) {
+        summaryElement.textContent = 'loading…'
+        const summary = await registry.loadHicFileIntoTargets(primaryMaps[genomeId])
+        for (const entry of built) {
+            if (summary.loaded.includes(entry.browser)) {
+                entry.expectedGenome = genomeId
+            }
+        }
+        renderSummary(summary)
+        renderAim()
+        renderRoster()
+    }
+
+    // A control map never changes a panel's genome, so the roster's expectations stay.
+    async function loadControl() {
+        summaryElement.textContent = 'loading…'
+        renderSummary(await registry.loadHicControlFileIntoTargets(controlMap))
+    }
+
+    /**
+     * Where a browser's 2D annotations actually are, one entry per chromosome pair.
+     *
+     * `track.featureMap` is keyed `"chr1_chr2"` and each feature carries
+     * `chr1/x1/x2` and `chr2/y1/y2`, so the extent is a min/max over the map --
+     * no need to know anything about the file that was loaded. That matters for a
+     * harness: a 2D fan-out that lands off-screen is indistinguishable from one
+     * that did not happen.
+     */
+    function annotationRegions(browser) {
+
+        const regions = []
+
+        for (const track of browser.tracks2D ?? []) {
+            for (const features of Object.values(track.featureMap ?? {})) {
+
+                if (0 === features.length) {
+                    continue
+                }
+
+                const extent = features.reduce((acc, f) => ({
+                    x1: Math.min(acc.x1, f.x1), x2: Math.max(acc.x2, f.x2),
+                    y1: Math.min(acc.y1, f.y1), y2: Math.max(acc.y2, f.y2)
+                }), {x1: Infinity, x2: -Infinity, y1: Infinity, y2: -Infinity})
+
+                const {chr1, chr2} = features[0]
+                regions.push({...extent, chr1, chr2, count: features.length, name: track.name})
+            }
+        }
+
+        return regions
+    }
+
+    // Padded, with a floor: these fixtures are motif-resolution anchors tens of bp
+    // wide, and an unpadded window on one would be a view no map has a rung for.
+    function locusString({chr1, chr2, x1, x2, y1, y2}) {
+
+        // On the diagonal, both axes get the union. A cluster of intrachromosomal
+        // loops shares one anchor, so its x extent is a few tens of bp against a
+        // y extent of hundreds of kb -- and axes that far apart put the diagonal,
+        // which is where the features sit, off screen.
+        if (chr1 === chr2) {
+            const [lo, hi] = [Math.min(x1, y1), Math.max(x2, y2)]
+            ;[x1, x2, y1, y2] = [lo, hi, lo, hi]
+        }
+
+        const pad = ([start, end]) => {
+            const padding = Math.max((end - start) * 0.2, 25000)
+            return [Math.max(0, Math.round(start - padding)), Math.round(end + padding)]
+        }
+        const [xStart, xEnd] = pad([x1, x2])
+        const [yStart, yEnd] = pad([y1, y2])
+        return `${chr1}:${xStart}-${xEnd} ${chr2}:${yStart}-${yEnd}`
+    }
+
+    // Repeated clicks cycle the chromosome pairs, since a 2D file routinely covers
+    // several and only one can be on screen at a time.
+    let nextRegion = 0
+
+    async function goToAnnotations() {
+
+        const regions = annotationRegions(registry.currentBrowser)
+
+        if (0 === regions.length) {
+            summaryElement.textContent = `no 2D annotations loaded in ${label(registry.currentBrowser)} — load some first`
+            return
+        }
+
+        const region = regions[nextRegion++ % regions.length]
+        const locus = locusString(region)
+
+        // Every targeted panel that carries this same chromosome pair, so the
+        // panels the fan-out reached all land in the same place. A panel without
+        // the annotation is left where it is rather than sent to coordinates that
+        // mean nothing to it -- the same rule the fan-out itself follows.
+        const going = registry.targetedBrowsers.filter(browser => annotationRegions(browser)
+            .some(({chr1, chr2}) => chr1 === region.chr1 && chr2 === region.chr2))
+
+        await Promise.all(going.map(browser => browser.parseGotoInput(locus)))
+
+        summaryElement.textContent = [
+            `went to: ${locus}`,
+            `region:  ${region.chr1}/${region.chr2}, ${region.count} feature(s) from "${region.name}"`,
+            `panels:  ${going.map(label).join(', ') || '—'}`
+        ].join('\n')
+    }
+
+    // The event a host subscribes to instead of re-deriving the implicit-current rule.
+    EventBus.globalBus.subscribe('BrowserTargetChange', () => renderAim())
+
+    ;(async function () {
+
+        // Every panel starts with no map: what each one holds is decided by the
+        // loads, not by this page. Panel 1 is the one everything is aimed from to
+        // begin with.
+        const first = await addPanel(undefined, undefined)
+        registry = first.registry
+
+        // Sequential rather than Promise.all: panel order is registry order, and this
+        // page is about which panel is which.
+        for (let i = 1; i < panelCount; i++) {
+            await addPanel(undefined, undefined)
+        }
+
+        // Panel 1 is made current before anything else happens. `add()` selects,
+        // so the last panel built would otherwise be the one the first load lands in.
+        registry.select(first)
+
+        renderAim()
+        renderRoster()
+
+        document.getElementById('add-browser')
+            .addEventListener('click', () => addPanel(hg38Maps[0], 'hg38').then(() => {
+                renderAim()
+                renderRoster()
+            }))
+
+        document.getElementById('map-hg38').addEventListener('click', () => loadMap('hg38'))
+        document.getElementById('map-mm10').addEventListener('click', () => loadMap('mm10'))
+        document.getElementById('control-hg38').addEventListener('click', () => loadControl())
+        document.getElementById('load-1d').addEventListener('click', () => fanOut([track1D]))
+        document.getElementById('load-2d').addEventListener('click', () => fanOut([track2D]))
+        document.getElementById('load-both').addEventListener('click', () => fanOut([track1D, track2D]))
+        document.getElementById('goto-2d').addEventListener('click', () => goToAnnotations())
+
+    })()
+
+</script>
+
+</body>
+</html>

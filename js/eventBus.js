@@ -52,6 +52,44 @@ class EventBus {
 
     }
 
+    /**
+     * Detach a subscriber. Removes every registration it made for this event
+     * type, and is a no-op if the type or the subscriber is unknown.
+     *
+     * Hosts need this: a handler attached to a browser that is later discarded
+     * has no other way off, and `EventBus.globalBus` outlives every browser on
+     * the page. See #414.
+     */
+    unsubscribe(eventType, object) {
+
+        const subscriberList = this.subscribers[eventType];
+        if (undefined === subscriberList) {
+            return;
+        }
+
+        // Spliced in place rather than replaced, so a post already walking this
+        // list sees the removal. post() takes its own snapshot to stay safe.
+        for (let index = subscriberList.length - 1; index >= 0; index--) {
+            if (subscriberList[index] === object) {
+                subscriberList.splice(index, 1);
+            }
+        }
+    }
+
+    /**
+     * Drop every subscriber, and anything held.
+     *
+     * For a bus that dies with its owner: `HICBrowser.dispose()` calls this on
+     * the per-browser bus, which is what releases the host handlers still
+     * attached to a browser being torn down. Never call it on
+     * `EventBus.globalBus` -- those registrations belong to the host and
+     * outlive every browser on the page. See #493.
+     */
+    clear() {
+        this.subscribers = {};
+        this.stack = [];
+    }
+
     post(event) {
 
         const eventType = event.type
@@ -59,10 +97,13 @@ class EventBus {
         if (this._hold) {
             this.stack.push(event)
         } else {
+            // Snapshot: a subscriber is entitled to detach itself while being
+            // notified, and iterating the live list would then skip whoever
+            // sits behind it.
             const subscriberList = this.subscribers[eventType];
 
             if (subscriberList) {
-                for (let subscriber of subscriberList) {
+                for (let subscriber of [...subscriberList]) {
 
                     if ("function" === typeof subscriber.receiveEvent) {
                         subscriber.receiveEvent(event);

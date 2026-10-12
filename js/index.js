@@ -21,16 +21,20 @@
  *
  */
 
-import {igvxhr} from '../node_modules/igv-utils/src/index.js'
+import '../css/juicebox.scss';
+import {igvxhr} from 'igv-utils'
 import {createBrowser, setCurrentBrowser, getAllBrowsers, getCurrentBrowser} from './createBrowser.js';
 import {version} from "./version.js";
 import {compressedSession, restoreSession, toJSON} from "./session.js";
-import {init} from "./init.js"
+import {init, initRegistry} from "./init.js"
 import EventBus from "./eventBus.js"
+import {setUrlMapper} from "./urlMapper.js"
+import {filenameFromUrl} from "./utils.js"
 
 export default {
     version,
     init,
+    initRegistry,
     toJSON,
     restoreSession,
     compressedSession,
@@ -39,5 +43,7 @@ export default {
     setCurrentBrowser,
     getAllBrowsers,
     igvxhr,
-    EventBus
+    EventBus,
+    setUrlMapper,
+    filenameFromUrl
 }
