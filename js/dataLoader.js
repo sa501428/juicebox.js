@@ -143,6 +143,7 @@ class DataLoader {
             return undefined;
         }
 
+        this.browser.datasetLoadsInProgress = (this.browser.datasetLoadsInProgress || 0) + 1;
         this.browser.clearDataset();
         let name
         try {
@@ -294,6 +295,7 @@ class DataLoader {
 
             throw error;
         } finally {
+            this.browser.datasetLoadsInProgress--;
             this.browser.stopSpinner();
             if (!noUpdates) {
                 this.browser.userInteractionShield.style.display = 'none';
@@ -336,6 +338,7 @@ class DataLoader {
      * @returns {Promise<HiCDataset>}
      */
     async loadLiveContactMap(config, noUpdates) {
+        this.browser.datasetLoadsInProgress = (this.browser.datasetLoadsInProgress || 0) + 1;
         this.browser.clearDataset();
 
         try {
@@ -395,6 +398,7 @@ class DataLoader {
             this.browser.contactMapLabel.title = "";
             throw error;
         } finally {
+            this.browser.datasetLoadsInProgress--;
             this.browser.stopSpinner();
             if (!noUpdates) {
                 this.browser.userInteractionShield.style.display = 'none';

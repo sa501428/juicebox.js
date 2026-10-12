@@ -1848,7 +1848,10 @@ class HICBrowser {
      * Called separately from rendering to keep concerns separated.
      */
     syncToOtherBrowsers() {
-        if (this.synchedBrowsers.size === 0) {
+        // A load restores an initial view before adopting a peer. Its old
+        // membership remains for preference mirroring, but that initial view
+        // must never move the peers it is about to follow.
+        if (this.datasetLoadsInProgress || this.synchedBrowsers.size === 0) {
             return; // Nothing to sync
         }
 
