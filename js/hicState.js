@@ -119,7 +119,10 @@ class State {
     async _adjustPixelSize(targetPixelSize, browser, zoom, options = {}) {
         const { minPixelSize, useDefaultMin = false } = options;
 
-        let adjustedPixelSize = Math.max(1, targetPixelSize);
+        const fractionalOverview = options.allowFractional ?? (browser?.dataset?.allOverview &&
+            (browser.dataset.isWholeGenome(this.chr1) || zoom === SENTINEL_ZOOM));
+        const floor = fractionalOverview ? Number.EPSILON : 1;
+        let adjustedPixelSize = Math.max(floor, targetPixelSize);
 
         let actualMinPixelSize = minPixelSize;
         if (actualMinPixelSize === undefined && browser) {
@@ -128,7 +131,7 @@ class State {
 
         if (actualMinPixelSize !== undefined) {
             adjustedPixelSize = useDefaultMin
-                ? Math.max(DEFAULT_PIXEL_SIZE, actualMinPixelSize)
+                ? Math.max(fractionalOverview ? Number.EPSILON : DEFAULT_PIXEL_SIZE, actualMinPixelSize)
                 : Math.max(adjustedPixelSize, actualMinPixelSize);
         } else if (useDefaultMin) {
             adjustedPixelSize = Math.max(DEFAULT_PIXEL_SIZE, adjustedPixelSize);
@@ -177,6 +180,11 @@ class State {
     async setView(chr1, chr2, x, y, zoom, pixelSize, browser, dataset, viewDimensions, options = {}) {
         const { useDefaultMin = false, minPixelSize, clampXY = true, adjustPixelSize = true } = options;
 
+        if (dataset?.allOverview && (dataset.isWholeGenome(chr1) || dataset.isWholeGenome(chr2))) {
+            chr1 = chr2 = dataset.wholeGenomeChromosome.index;
+            zoom = 0;
+            this.normalization = 'NONE';
+        }
         // Axis ordering (ADR-0006 decision 3). A .hic file stores one triangle of a
         // symmetric matrix, so an unordered pair names a view that already has a
         // canonical spelling. Transpose it here — the one place that receives both
@@ -203,6 +211,7 @@ class State {
         if (dataset && dataset.isSingleChromosome() && dataset.isWholeGenome(chr1)) {
             chr1 = chr2 = dataset.soleChromosome().index;
             zoom = SENTINEL_ZOOM;
+            this.sentinelAllIndex = dataset.wholeGenomeChromosome.index;
             redirected = true;
         }
 
@@ -224,7 +233,8 @@ class State {
         // that browser.minPixelSize is consulted with the pre-mutation chr1/chr2 (and the
         // post-mutation zoom).
         const adjustedPixelSize = adjustPixelSize
-            ? await this._adjustPixelSize(pixelSize, browser, zoom, { useDefaultMin, minPixelSize: sizedAgainst })
+            ? await this._adjustPixelSize(pixelSize, browser, zoom, { useDefaultMin, minPixelSize: sizedAgainst,
+                allowFractional: Boolean(dataset?.allOverview && (dataset.isWholeGenome(chr1) || zoom === SENTINEL_ZOOM)) })
             : pixelSize;
 
         this.chr1 = chr1;
@@ -245,7 +255,7 @@ class State {
         const { width, height } = viewDimensions
         const { chromosomes } = dataset;
 
-        const binSize = dataset.binSizeForZoom(this.zoom);
+        const binSize = dataset.binSizeForZoom(this.zoom, this.chr1);
         const maxX = Math.max(0, chromosomes[this.chr1].size / binSize -  width / this.pixelSize);
         const maxY = Math.max(0, chromosomes[this.chr2].size / binSize - height / this.pixelSize);
 
@@ -263,7 +273,7 @@ class State {
         // the same number once a rung is filtered (an A/B map) or synthesised
         // (the sentinel), and this used to index one by the other.
         const adjustedPixelSize = await this._adjustPixelSize(pixelSize, browser, zoom)
-        const currentBinSize = dataset.binSizeForZoom(this.zoom)
+        const currentBinSize = dataset.binSizeForZoom(this.zoom, this.chr1)
         const gx = (this.x + anchorPx / this.pixelSize) * currentBinSize
         const gy = (this.y + anchorPy / this.pixelSize) * currentBinSize
         const newX = gx / binSize - anchorPx / adjustedPixelSize
@@ -295,8 +305,8 @@ class State {
         const xCenter = this.x + (width / 2) / this.pixelSize
         const yCenter = this.y + (height / 2) / this.pixelSize
 
-        const binSize = dataset.binSizeForZoom(this.zoom)
-        const binSizeNew = dataset.binSizeForZoom(zoom)
+        const binSize = dataset.binSizeForZoom(this.zoom, this.chr1)
+        const binSizeNew = dataset.binSizeForZoom(zoom, this.chr1)
         const scaleFactor = binSize / binSizeNew
         const xCenterNew = xCenter * scaleFactor
         const yCenterNew = yCenter * scaleFactor
@@ -323,7 +333,7 @@ class State {
      * reflects what is actually on screen, derived from chr1/chr2/x/y/zoom/pixelSize.
      */
     getLocus(dataset, viewDimensions) {
-        const bpPerBin = dataset.binSizeForZoom(this.zoom);
+        const bpPerBin = dataset.binSizeForZoom(this.zoom, this.chr1);
         const startBP1 = Math.round(this.x * bpPerBin);
         const startBP2 = Math.round(this.y * bpPerBin);
         const chr1 = dataset.chromosomes[this.chr1];
@@ -489,7 +499,8 @@ class State {
         return {
             chr1Name: dataset.chromosomes[this.chr1].name,
             chr2Name: dataset.chromosomes[this.chr2].name,
-            binSize: dataset.binSizeForZoom(this.zoom),
+            binSize: dataset.binSizeForZoom(this.zoom, this.chr1),
+            wholeGenomeBinSize: dataset.isWholeGenome(this.chr1) ? dataset.wholeGenomeResolution : undefined,
             binX: this.x,
             binY: this.y,
             pixelSize: this.pixelSize
@@ -532,14 +543,16 @@ class State {
         let zoomNew, xBinNew, yBinNew, targetPixelSize
         if (wholeGenome) {
             zoomNew = 0
-            xBinNew = targetState.binX
-            yBinNew = targetState.binY
-            targetPixelSize = targetState.pixelSize
+            const ratio = targetState.wholeGenomeBinSize && dataset.wholeGenomeResolution
+                ? targetState.wholeGenomeBinSize / dataset.wholeGenomeResolution : 1;
+            xBinNew = targetState.binX * ratio
+            yBinNew = targetState.binY * ratio
+            targetPixelSize = targetState.pixelSize / ratio
         } else {
             zoomNew = (true === browser.resolutionLocked)
                 ? this.zoom
                 : browser.findMatchingZoomIndex(bpPerPixelTarget, browser.getResolutions())
-            const binSizeNew = dataset.binSizeForZoom(zoomNew)
+            const binSizeNew = dataset.binSizeForZoom(zoomNew, chr1.index)
             xBinNew = targetState.binX * (targetState.binSize / binSizeNew)
             yBinNew = targetState.binY * (targetState.binSize / binSizeNew)
             targetPixelSize = binSizeNew / bpPerPixelTarget
@@ -645,8 +658,8 @@ class State {
         // decision 6 says is that it is written out as one.
         const atSentinel = SENTINEL_ZOOM === this.zoom;
         return {
-            chr1: atSentinel ? 0 : this.chr1,
-            chr2: atSentinel ? 0 : this.chr2,
+            chr1: atSentinel ? (this.sentinelAllIndex ?? 0) : this.chr1,
+            chr2: atSentinel ? (this.sentinelAllIndex ?? 0) : this.chr2,
             zoom: atSentinel ? 0 : this.zoom,
             x: this.x,
             y: this.y,
@@ -681,14 +694,14 @@ class State {
      * see #510 for the defect and ADR-0009's sequencing for why it landed
      * before candidate 6's gate.
      */
-    static default() {
+    static default(dataset) {
         return new State(
-            0,                      // chr1: whole genome
-            0,                      // chr2: whole genome
+            dataset?.wholeGenomeChromosome?.index ?? 0, // chr1: whole genome
+            dataset?.wholeGenomeChromosome?.index ?? 0, // chr2: whole genome
             0,                      // zoom: coarsest resolution index
             0,                      // x: bin origin
             0,                      // y: bin origin
-            DEFAULT_PIXEL_SIZE,     // one pixel per bin, the browser-wide default
+            dataset?.allOverview ? Number.EPSILON : DEFAULT_PIXEL_SIZE, // scaled All fits its complete stored grid
             'NONE'                  // normalization
         )
     }

@@ -4,13 +4,22 @@
  * and Straw's caller-oriented, exact contact records.
  */
 class V10DisplayMatrix {
-    constructor(matrix) {
+    constructor(matrix, allOverview, allChromosome) {
         this.chr1 = matrix.chr1
         this.chr2 = matrix.chr2
         const displayZooms = values => [...values]
             .sort((a, b) => b.zoom.binSize - a.zoom.binSize)
             .map((value, index) => ({...value, zoom: {...value.zoom, index}}))
-        this.bpZoomData = displayZooms(matrix.bpZoomData)
+        const scaledAll = allOverview && matrix.chr1 === allOverview.chromosomeIndex && matrix.chr2 === matrix.chr1
+        let bpZooms = matrix.bpZoomData;
+        if (scaledAll) bpZooms = bpZooms.filter(zd => zd.zoom.binSize === allOverview.finestResolution);
+        else if (allChromosome && matrix.chr1 === allChromosome.index && matrix.chr2 === matrix.chr1) {
+            const occupied = bpZooms.filter(zd => zd.occupiedCellCount > 0n);
+            const candidates = occupied.length ? occupied : bpZooms;
+            const target = allChromosome.size / 500;
+            bpZooms = [...candidates].sort((a, b) => Math.abs(a.zoom.binSize - target) - Math.abs(b.zoom.binSize - target)).slice(0, 1);
+        }
+        this.bpZoomData = displayZooms(bpZooms)
         this.fragZoomData = displayZooms(matrix.fragZoomData)
     }
 

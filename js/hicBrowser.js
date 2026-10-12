@@ -552,6 +552,9 @@ class HICBrowser {
     getResolutions() {
         if (!this.dataset) return []
 
+        if (this.dataset.allOverview && this.dataset.isWholeGenome(this.state.chr1)) {
+            return [{index: 0, binSize: this.dataset.allOverview.effectiveResolution}]
+        }
         const baseResolutions = this.dataset.bpResolutions.map(function (resolution, index) {
             return {index: index, binSize: resolution}
         })
@@ -591,7 +594,7 @@ class HICBrowser {
      * `clampXY`, no browser at all -- reads `dataset.binSizeForZoom` directly.
      */
     binSizeForZoom(zoom = this.state.zoom) {
-        return this.dataset.binSizeForZoom(zoom)
+        return this.dataset.binSizeForZoom(zoom, this.state.chr1)
     }
 
     isWholeGenome() {
@@ -885,9 +888,11 @@ class HICBrowser {
 
         let width = this.contactMatrixView.getViewDimensions().width
         let resolution = this.binSizeForZoom(this.state.zoom)
+        const overview = this.dataset.isWholeGenome(this.state.chr1) ? this.dataset.allOverview : undefined;
+        if (overview) resolution = overview.effectiveResolution;
         const bpp =
             (this.dataset.chromosomes[this.state.chr1].name.toLowerCase() === "all") ?
-                this.genome.getGenomeLength() / width :
+                (overview ? resolution / this.state.pixelSize : this.genome.getGenomeLength() / width) :
                 resolution / this.state.pixelSize
 
         const gs =
@@ -904,6 +909,7 @@ class HICBrowser {
             gs.startBP = this.state.y * resolution
             gs.endBP = gs.startBP + bpp * this.contactMatrixView.getViewDimensions().height
         }
+        if (overview) gs.chromosome = {...gs.chromosome, size: overview.displayLength, bpLength: overview.displayLength};
         return gs
     }
 
@@ -1486,7 +1492,7 @@ class HICBrowser {
         );
 
         const requestedNormalization = restored.normalization;
-        restored.normalization = await this.#resolveNormalization(requestedNormalization);
+        restored.normalization = await this.#resolveNormalization(requestedNormalization, restored);
 
         this.#state = restored;
 
@@ -1558,7 +1564,8 @@ class HICBrowser {
      * @param {string|undefined} requested - The normalization asked for
      * @returns {Promise<string>} - A normalization the loaded dataset offers
      */
-    async #resolveNormalization(requested) {
+    async #resolveNormalization(requested, state = this.state) {
+        if (this.dataset?.allOverview && (this.dataset.isWholeGenome(state?.chr1) || state?.zoom === SENTINEL_ZOOM)) return 'NONE';
 
         if (undefined === requested || 'NONE' === requested) {
             return 'NONE';
@@ -1711,6 +1718,7 @@ class HICBrowser {
     }
 
     setNormalization(normalization) {
+        if (this.dataset?.allOverview && (this.dataset.isWholeGenome(this.#state?.chr1) || this.#state?.zoom === SENTINEL_ZOOM)) normalization = 'NONE';
         if (this.#state) {
             this.#state.normalization = normalization;
         }

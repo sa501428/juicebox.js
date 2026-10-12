@@ -144,6 +144,51 @@ describe('v10 dataset and rendering integration', () => {
         }
     })
 
+    it('paints stored All from its finest synthetic zoom with no screen or canvas', async () => {
+        const dataset = await load('pseudo-all')
+        const source = new ImageTileSource({colorScale: new ColorScale({threshold: 5, r: 255, g: 0, b: 0}), createTile: raster, tileDimension: 32})
+        const state = {chr1: 2, chr2: 2, zoom: 0, x: 0, y: 0, pixelSize: 1, normalization: 'NONE'}
+        source.setColorScale(source.colorScale, 'A', state)
+        const tiles = []
+        for await (const tile of source.tilesFor({dataset, state,
+            displayMode: 'A', viewDimensions: {width: 32, height: 32}})) tiles.push(tile)
+        expect(tiles[0].binSize).toBe(1)
+        expect(tiles[0].image.buffer.data.filter((v, i) => i % 4 === 3 && v > 0).length).toBe(6)
+    })
+
+    it('selects the preserved legacy All matrix rather than empty global levels after conversion', async () => {
+        const dataset = await load('legacy-all')
+        expect(dataset.allOverview).toBeUndefined()
+        const all = dataset.wholeGenomeChromosome
+        expect(all.index).toBe(0)
+        const matrix = await dataset.getMatrix(all.index, all.index)
+        expect(matrix.bpZoomData.map(z => z.zoom.binSize)).toEqual([35])
+        expect(dataset.binSizeForZoom(0, all.index)).toBe(35)
+        expect(dataset.wholeGenomeResolution).toBe(35000)
+        const records = await dataset.getContactRecords('NONE', {chr: all.name, start: 0, end: all.size},
+            {chr: all.name, start: 0, end: all.size}, 'BP', 35)
+        expect(records).toHaveLength(3)
+    })
+
+    it('compares matching physical All layouts with different synthetic finest bins', async () => {
+        const dataset = await load('pseudo-all')
+        const controlDataset = await load('pseudo-all-finest2')
+        const query = vi.spyOn(controlDataset, 'getContactRecords')
+        const source = new ImageTileSource({colorScale: new ColorScale({threshold: 5, r: 255, g: 0, b: 0}), createTile: raster, tileDimension: 32})
+        const state = {chr1: 2, chr2: 2, zoom: 0, x: 0, y: 0, pixelSize: 1, normalization: 'NONE'}
+        for await (const tile of source.tilesFor({dataset, controlDataset, state,
+            displayMode: 'B', viewDimensions: {width: 32, height: 32}})) {
+            expect(tile.binSize).toBe(2)
+        }
+        expect(query.mock.calls.at(-1)[4]).toBe(2)
+        expect(query.mock.calls.some(call => call[1].chr === 'All' && call[1].start === 0 && call[1].end === 64)).toBe(true)
+        controlDataset.allOverview = {...controlDataset.allOverview, groupFactor: 2}
+        await expect((async () => {
+            for await (const tile of source.tilesFor({dataset, controlDataset, state,
+                displayMode: 'B', viewDimensions: {width: 32, height: 32}})) void tile
+        })()).rejects.toThrow('matching stored All layouts')
+    })
+
     it('loads a local File through the same blob path used by juicebox-web', async () => {
         const bytes = bytesFor('cis')
         const file = new NativeFile([bytes], 'cis-v10.hic')

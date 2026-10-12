@@ -84,3 +84,24 @@ for await (const tile of source.tilesFor({dataset, state: {
 assert.ok(painted > 0, 'tile contains no painted contacts')
 console.log(`Rendered ${painted} pixels at ${binSize} bp; read ${bytesRead} bytes in total`)
 console.log(`Validated ${path}; first chromosome ${chromosome.name}; All present: ${Boolean(dataset.wholeGenomeChromosome)}`)
+
+if (dataset.allOverview) {
+    const all = dataset.wholeGenomeChromosome;
+    const overview = dataset.allOverview;
+    const begin = performance.now(), bytesBefore = bytesRead;
+    const allRegion = {chr: all.name, start: 0, end: all.size};
+    const records = await dataset.straw.getContactRecords('NONE', allRegion, allRegion, 'BP', overview.finestResolution);
+    const sum = records.reduce((n, r) => n + BigInt(r.counts), 0n);
+    const elapsed = performance.now() - begin, storedBytes = bytesRead - bytesBefore;
+    const collapsed = await dataset.straw.getContactRecords('NONE', allRegion, allRegion, 'BP', dataset.bpResolutions[0]);
+    assert.equal(collapsed.reduce((n, r) => n + BigInt(r.counts), 0n), sum);
+    assert.equal((await dataset.getMatrix(all.index, all.index)).getZoomDataByIndex(0).zoom.binSize, overview.finestResolution);
+    let allPixels = 0;
+    for await (const tile of source.tilesFor({dataset, state: {
+        chr1: all.index, chr2: all.index, zoom: 0, x: 0, y: 0, pixelSize: 1, normalization: 'NONE'
+    }, displayMode: 'A', viewDimensions: {width: 32, height: 32}})) {
+        allPixels += tile.image.buffer.data.filter((value, index) => index % 4 === 3 && value > 0).length;
+    }
+    assert.ok(allPixels > 0, 'All tile contains no painted contacts');
+    console.log(`Stored All: ${overview.binCount} bins, ${records.length} cells, sum ${sum}, ${storedBytes} bytes, ${elapsed.toFixed(1)} ms, ${allPixels} painted pixels`);
+}

@@ -73,7 +73,8 @@ class ChromosomeSelector {
         const chromosomes = dataset.isSingleChromosome()
             ? dataset.chromosomes.filter(chromosome => !dataset.isWholeGenome(chromosome.index))
             : dataset.chromosomes;
-        const options = chromosomes.map(({ name, index }) => `<option value="${index}">${name}</option>`).join('');
+        const ordered = [...chromosomes].sort((a, b) => Number(dataset.isWholeGenome(b.index)) - Number(dataset.isWholeGenome(a.index)));
+        const options = ordered.map(({ name, index }) => `<option value="${index}">${name}</option>`).join('');
         this.xAxisSelector.innerHTML = options;
         this.yAxisSelector.innerHTML = options;
 

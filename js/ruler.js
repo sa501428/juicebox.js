@@ -99,7 +99,9 @@ class Ruler {
 
         list = dataset.chromosomes.filter(chromosome => chromosome.name.toLowerCase() !== 'all');
 
-        extent = list.reduce((sum, chromosome) => sum + chromosome.size, 0);
+        const overview = dataset.allOverview;
+        const layoutSize = chr => overview ? overview.layout.find(c => c.index === chr.index).size : chr.bpLength;
+        extent = overview ? overview.displayLength : list.reduce((sum, chromosome) => sum + chromosome.size, 0);
 
         dimen = axisName === 'x' ? axisElement.offsetWidth : axisElement.offsetHeight;
 
@@ -108,7 +110,7 @@ class Ruler {
         firstDivElement = undefined;
 
         for (const chr of list) {
-            const percentage = chr.bpLength / extent;
+            const percentage = layoutSize(chr) / extent;
 
             if (percentage * dimen < 1.0) {
                 scraps += percentage;

@@ -34,7 +34,8 @@
  * @constructor
  */
 class Genome {
-    constructor(id, chromosomes) {
+    constructor(id, chromosomes, allOverview) {
+        this.allOverview = allOverview;
 
         this.id = id;
         this.chromosomes = chromosomes
@@ -101,16 +102,17 @@ class Genome {
     };
 
     getChromosomeForCoordinate(bp) {
-        var i = 0,
-            offset = 0,
-            l;
-
-        for (i = 1; i < this.chromosomes.length; i++) {
-            l = this.chromosomes[i].size;
-            if (offset + l > bp) return this.chromosomes[i];
-            offset += l;
+        const real = this.chromosomes.filter(c => c.name.toLowerCase() !== 'all');
+        if (this.allOverview) {
+            const segment = this.allOverview.layout.find(c => bp < c.offset + c.size);
+            return segment ? this.chromosomes[segment.index] : real[real.length - 1];
         }
-        return this.chromosomes[this.chromosomes.length - 1];
+        let offset = 0;
+        for (const chr of real) {
+            if (offset + chr.size > bp) return chr;
+            offset += chr.size;
+        }
+        return real[real.length - 1];
     }
 
 
@@ -168,7 +170,7 @@ function computeCumulativeOffsets() {
     let offset = 0;
     // Skip first chromosome (its chr all).
     for (let chromosome of this.chromosomes) {
-        if(chromosome.name === 'all') continue;
+        if(chromosome.name.toLowerCase() === 'all') continue;
         cumulativeOffsets[chromosome.name] = Math.floor(offset);
         offset += (chromosome.size);
     }

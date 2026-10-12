@@ -23,6 +23,7 @@
  */
 
 import ColorScale from './colorScale.js'
+import {SENTINEL_ZOOM} from './sentinelZoom.js'
 import {
     tileKey,
     colorScaleKey,
@@ -163,8 +164,33 @@ class ImageTileSource {
      */
     async* tilesFor({dataset, controlDataset, state, displayMode, viewDimensions}) {
 
-        const {ds, dsControl, zoom, controlZoom} =
-            resolveDisplayMode(dataset, controlDataset, state.zoom, displayMode)
+        const wholeGenome = dataset.isWholeGenome(state.chr1) || state.zoom === SENTINEL_ZOOM;
+        let resolved;
+        if (wholeGenome && dataset.allOverview) {
+            resolved = {ds: dataset, dsControl: null, zoom: 0, controlZoom: 0};
+            if (displayMode === 'B') resolved.ds = controlDataset;
+            else if (displayMode === 'BOA') { resolved.ds = controlDataset; resolved.dsControl = dataset; }
+            else if (displayMode === 'AOB' || displayMode === 'AMB') resolved.dsControl = controlDataset;
+            if (resolved.ds !== dataset || resolved.dsControl) {
+                const a = dataset.allOverview, b = controlDataset?.allOverview;
+                if (!b || a.sourceResolution !== b.sourceResolution || a.groupFactor !== b.groupFactor ||
+                    a.binCount !== b.binCount || a.layout.length !== b.layout.length ||
+                    a.layout.some((c, i) => c.name !== b.layout[i].name || c.size !== b.layout[i].size)) {
+                    throw new Error('Whole-genome comparison requires matching stored All layouts; select a chromosome to compare these maps');
+                }
+            }
+        } else resolved = resolveDisplayMode(dataset, controlDataset, state.zoom, displayMode);
+        const {ds, dsControl, zoom, controlZoom} = resolved;
+        const indicesFor = target => {
+            if (target === dataset || !target.chromosomes || !dataset.chromosomes) return [state.chr1, state.chr2];
+            const canonical = name => name.toLowerCase().replace(/^chr/, '');
+            return [state.chr1, state.chr2].map(index => {
+                const name = canonical(dataset.chromosomes[index].name);
+                const chromosome = target.chromosomes.find(c => canonical(c.name) === name);
+                if (!chromosome) throw new Error(`Chromosome ${dataset.chromosomes[index].name} is absent from the control map`);
+                return chromosome.index ?? target.chromosomes.indexOf(chromosome);
+            });
+        };
 
         // Which matrix carries the view, and at which of its resolutions. An
         // identity for a declared rung; at the sentinel it is the whole-genome
@@ -173,13 +199,15 @@ class ImageTileSource {
         // -- and so the x4 auto-threshold below -- true at the sentinel, while
         // `browser.isWholeGenome()` is false. Divergent by design; see
         // ADR-0010 decisions 3 and 4 before reconciling them.
-        const view = ds.matrixViewForZoom(state.chr1, state.chr2, zoom)
+        const [chr1, chr2] = indicesFor(ds);
+        const view = ds.matrixViewForZoom(chr1, chr2, zoom)
         const matrix = await ds.getMatrix(view.chr1, view.chr2)
         const zd = matrix.getZoomDataByIndex(view.zoomIndex, "BP")
 
         let zdControl = null
         if (dsControl) {
-            const controlView = dsControl.matrixViewForZoom(state.chr1, state.chr2, controlZoom)
+            const [controlChr1, controlChr2] = indicesFor(dsControl);
+            const controlView = dsControl.matrixViewForZoom(controlChr1, controlChr2, controlZoom)
             const matrixControl = await dsControl.getMatrix(controlView.chr1, controlView.chr2)
             zdControl = matrixControl.getZoomDataByIndex(controlView.zoomIndex, "BP")
         }
@@ -324,8 +352,11 @@ class ImageTileSource {
 
             let controlRecordList
             if (zdControl) {
+                const controlRegion = region => ds.allOverview && ds.isWholeGenome(zd.chr1.index)
+                    ? {...region, start: region.start / binSize * zdControl.zoom.binSize,
+                        end: region.end / binSize * zdControl.zoom.binSize} : region;
                 controlRecordList = await dsControl.getContactRecords(
-                    normalization, region1, region2, zdControl.zoom.unit, zdControl.zoom.binSize)
+                    normalization, controlRegion(region1), controlRegion(region2), zdControl.zoom.unit, zdControl.zoom.binSize)
             }
 
             const image = this.createTile(this.tileDimension)

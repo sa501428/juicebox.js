@@ -264,7 +264,8 @@ class Dataset {
      * exactly -- ADR-0010 fact 4, and the reason this is a unit match rather
      * than a conversion.
      */
-    binSizeForZoom(zoom) {
+    binSizeForZoom(zoom, chromosomeIndex) {
+        if (this.allOverview && this.isWholeGenome(chromosomeIndex)) return this.allOverview.finestResolution;
         return SENTINEL_ZOOM === zoom ? this.wholeGenomeResolution : this.bpResolutions[zoom];
     }
 
@@ -405,12 +406,20 @@ class HiCDataset extends Dataset {
             ? [...this.hicFile.fragResolutions].reverse()
             : this.hicFile.fragResolutions
         this.displayMatrixCache = new WeakMap()
+        this.allOverview = this.hicFile.allOverview
         this.wholeGenomeChromosome = this.hicFile.wholeGenomeChromosome
         this.wholeGenomeResolution = this.hicFile.wholeGenomeResolution
 
         // Attempt to determine genomeId if not recognized
         const tmp = matchGenome(this.chromosomes);
         if (tmp) this.genomeId = tmp;
+    }
+
+    binSizeForZoom(zoom, chromosomeIndex) {
+        if (this.hicFile.version === 10 && !this.allOverview && this.isWholeGenome(chromosomeIndex)) {
+            return this.legacyAllBinSize ?? this.wholeGenomeResolution / 1000;
+        }
+        return super.binSizeForZoom(zoom, chromosomeIndex);
     }
 
     async getContactRecords(normalization, region1, region2, units, binsize) {
@@ -432,9 +441,14 @@ class HiCDataset extends Dataset {
         const matrix = await this.hicFile.getMatrix(chr1, chr2)
         if (!matrix || this.hicFile.version !== 10) return matrix
         if (!this.displayMatrixCache.has(matrix)) {
-            this.displayMatrixCache.set(matrix, new V10DisplayMatrix(matrix))
+            this.displayMatrixCache.set(matrix, new V10DisplayMatrix(matrix, this.allOverview, this.wholeGenomeChromosome))
         }
-        return this.displayMatrixCache.get(matrix)
+        const display = this.displayMatrixCache.get(matrix);
+        if (!this.allOverview && this.isWholeGenome(chr1) && chr1 === chr2 && display.bpZoomData.length) {
+            this.legacyAllBinSize = display.bpZoomData[0].zoom.binSize;
+            this.wholeGenomeResolution = this.legacyAllBinSize * 1000;
+        }
+        return display;
     }
 
     async getNormVectorIndex() {

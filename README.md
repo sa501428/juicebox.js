@@ -271,3 +271,21 @@ This checks derived sums, normalization, trans contacts, and rendered pixel
 buffers in sampled regions. It is not an exhaustive scan of the file. To release
 these repositories independently, replace the local dependencies with published
 versions or pinned commits containing the v10 reader and adapter before deploying.
+
+
+### Stored scaled All in V10
+
+The V10 dataset adapter recognizes the optional `hicAll.*` attributes produced
+by hictools. It opens appended All at its finest useful synthetic BP level,
+keeps file chromosome indices in sessions, displays All first in selectors,
+and uses the padded coarse layout for genome-wide boundaries and navigation.
+Collapsed levels are omitted from the overview selector. All uses `NONE`
+normalization. Real chromosome zooms continue to use the normal resolution
+ladder. No runtime genome-wide reconstruction or binary-format extension is
+required. `npm run validate:v10 -- /path/to/map.hic` checks a local map, exact
+aggregations, normalizations, trans queries and pixel-buffer rendering; for
+scaled All it also reports bytes and query time and compares count totals.
+
+Whole-genome A/B comparisons require matching physical stored-All layouts.
+Different synthetic finest bin sizes are supported when the physical layout
+matches. For different overview layouts, select real chromosomes to compare.

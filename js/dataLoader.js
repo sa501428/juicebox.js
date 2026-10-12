@@ -188,14 +188,14 @@ class DataLoader {
             // for that reason.
             if (config.locus) {
                 this.browser.setActiveDataset(dataset);
-                await this.browser.setState(State.default());
+                await this.browser.setState(State.default(dataset));
                 await this.browser.parseGotoInput(config.locus);
             } else if (config.state) {
                 this.browser.setActiveDataset(dataset);
                 await this.browser.setState(decodeState(config.state, reportUnknownStateType));
             } else {
                 this.browser.setActiveDataset(dataset);
-                await this.browser.setState(State.default());
+                await this.browser.setState(State.default(dataset));
             }
 
             // The state in force, not the one handed to the chokepoint.
@@ -312,7 +312,7 @@ class DataLoader {
      */
     #installGenome(dataset) {
         const previousGenomeId = this.browser.genome ? this.browser.genome.id : undefined;
-        this.browser.genome = new Genome(dataset.genomeId, dataset.chromosomes);
+        this.browser.genome = new Genome(dataset.genomeId, dataset.chromosomes, dataset.allOverview);
 
         if (this.browser.genome.id !== previousGenomeId) {
             this.browser.clearTracks();
