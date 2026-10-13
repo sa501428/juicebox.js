@@ -156,6 +156,28 @@ describe('v10 dataset and rendering integration', () => {
         expect(tiles[0].image.buffer.data.filter((v, i) => i % 4 === 3 && v > 0).length).toBe(6)
     })
 
+    it('paints V9-style kb All as compact bins while Straw retains sparse finest coordinates', async () => {
+        const dataset = await load('kilobase-all')
+        expect(dataset.wholeGenomeChromosome.size).toBe(170)
+        expect(dataset.binSizeForZoom(0, 2)).toBe(17)
+        const matrix = await dataset.getMatrix(2, 2)
+        expect(matrix.bpZoomData.map(z => z.zoom.binSize)).toEqual([17])
+        expect(matrix.bpZoomData[0].averageCount).toBe(Number((1n << 53n) + 49n) / 100)
+        const records = await dataset.getContactRecords('NONE', region('All', 0, 170), region('All', 0, 170), 'BP', 17)
+        expect(records.map(r => [r.bin1, r.bin2])).toEqual([[0, 1], [5, 9]])
+        const exact = await dataset.straw.getContactRecords('NONE', region('All', 0, 170), region('All', 0, 170), 'BP', 1)
+        expect(exact.map(r => [r.bin1, r.bin2])).toEqual([[0, 17], [85, 153]])
+        expect(exact[0].counts).toBe((1n << 53n) + 17n)
+        const source = new ImageTileSource({colorScale: new ColorScale({threshold: 5, r: 255, g: 0, b: 0}), createTile: raster, tileDimension: 16})
+        const state = {chr1: 2, chr2: 2, zoom: 0, x: 0, y: 0, pixelSize: 1, normalization: 'NONE'}
+        source.setColorScale(source.colorScale, 'A', state)
+        const tiles = []
+        for await (const tile of source.tilesFor({dataset, state,
+            displayMode: 'A', viewDimensions: {width: 16, height: 16}})) tiles.push(tile)
+        expect(tiles[0].binSize).toBe(17)
+        expect(tiles[0].image.buffer.data.filter((v, i) => i % 4 === 3 && v > 0).length).toBe(4)
+    })
+
     it('selects the preserved legacy All matrix rather than empty global levels after conversion', async () => {
         const dataset = await load('legacy-all')
         expect(dataset.allOverview).toBeUndefined()

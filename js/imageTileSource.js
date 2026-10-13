@@ -173,7 +173,9 @@ class ImageTileSource {
             else if (displayMode === 'AOB' || displayMode === 'AMB') resolved.dsControl = controlDataset;
             if (resolved.ds !== dataset || resolved.dsControl) {
                 const a = dataset.allOverview, b = controlDataset?.allOverview;
-                if (!b || a.sourceResolution !== b.sourceResolution || a.groupFactor !== b.groupFactor ||
+                if (!b || (a.version ?? 1) !== (b.version ?? 1) ||
+                    a.effectiveResolution !== b.effectiveResolution ||
+                    (a.version !== 2 && (a.sourceResolution !== b.sourceResolution || a.groupFactor !== b.groupFactor)) ||
                     a.binCount !== b.binCount || a.layout.length !== b.layout.length ||
                     a.layout.some((c, i) => c.name !== b.layout[i].name || c.size !== b.layout[i].size)) {
                     throw new Error('Whole-genome comparison requires matching stored All layouts; select a chromosome to compare these maps');

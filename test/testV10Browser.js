@@ -87,3 +87,17 @@ describe('real HICBrowser loads v10 under Node with a simulated DOM', () => {
         expect(restored.state.normalization).toBe('VC')
     })
 })
+
+describe('kilobase All viewport', () => {
+    it('fits the full compact axis including a partial terminal bin', async () => {
+        const browser = {
+            dataset: {
+                chromosomes: [{index: 0, name: 'All', size: 3088286}],
+                allOverview: {version: 2, binCount: 499},
+                isWholeGenome: index => index === 0
+            },
+            contactMatrixView: {getViewDimensions: () => ({width: 500, height: 600})}
+        }
+        expect(await HICBrowser.prototype.minPixelSize.call(browser, 0, 0, 0)).toBe(500 / 499)
+    })
+})

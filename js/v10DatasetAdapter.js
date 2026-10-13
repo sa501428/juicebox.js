@@ -12,7 +12,9 @@ class V10DisplayMatrix {
             .map((value, index) => ({...value, zoom: {...value.zoom, index}}))
         const scaledAll = allOverview && matrix.chr1 === allOverview.chromosomeIndex && matrix.chr2 === matrix.chr1
         let bpZooms = matrix.bpZoomData;
-        if (scaledAll) bpZooms = bpZooms.filter(zd => zd.zoom.binSize === allOverview.finestResolution);
+        if (scaledAll) bpZooms = bpZooms.filter(zd => zd.zoom.binSize === allOverview.finestResolution)
+            .map(zd => ({...zd, zoom: {...zd.zoom, binSize: allOverview.displayResolution ?? allOverview.finestResolution},
+                averageCount: Number(zd.sumCounts) / (allOverview.binCount * allOverview.binCount)}));
         else if (allChromosome && matrix.chr1 === allChromosome.index && matrix.chr2 === matrix.chr1) {
             const occupied = bpZooms.filter(zd => zd.occupiedCellCount > 0n);
             const candidates = occupied.length ? occupied : bpZooms;

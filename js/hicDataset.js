@@ -265,7 +265,7 @@ class Dataset {
      * than a conversion.
      */
     binSizeForZoom(zoom, chromosomeIndex) {
-        if (this.allOverview && this.isWholeGenome(chromosomeIndex)) return this.allOverview.finestResolution;
+        if (this.allOverview && this.isWholeGenome(chromosomeIndex)) return this.allOverview.displayResolution ?? this.allOverview.finestResolution;
         return SENTINEL_ZOOM === zoom ? this.wholeGenomeResolution : this.bpResolutions[zoom];
     }
 
@@ -423,7 +423,20 @@ class HiCDataset extends Dataset {
     }
 
     async getContactRecords(normalization, region1, region2, units, binsize) {
-        const records = await this.straw.getContactRecords(normalization, region1, region2, units, binsize)
+        const overview = this.allOverview;
+        const scaled = overview?.version === 2 && units === 'BP' &&
+            this.straw.getFileChrName(region1.chr).toLowerCase() === 'all' &&
+            this.straw.getFileChrName(region2.chr).toLowerCase() === 'all';
+        const records = await this.straw.getContactRecords(normalization, region1, region2, units,
+            scaled ? overview.finestResolution : binsize)
+        if (scaled) {
+            if (binsize !== overview.displayResolution) throw new Error('V10: invalid All display resolution');
+            return displayRecords(records, true).map(record => {
+                record.bin1 /= overview.storageStride;
+                record.bin2 /= overview.storageStride;
+                return record;
+            });
+        }
         if (this.hicFile.version !== 10) return records
         const sameChromosome = this.straw.getFileChrName(region1.chr) === this.straw.getFileChrName(region2.chr)
         return displayRecords(records, sameChromosome)

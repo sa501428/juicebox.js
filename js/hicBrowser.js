@@ -2048,6 +2048,12 @@ class HICBrowser {
             return DEFAULT_PIXEL_SIZE;
         }
 
+        const overview = this.dataset.allOverview;
+        if (overview?.version === 2 && this.dataset.isWholeGenome(chr1) && chr1 === chr2) {
+            const {width, height} = this.contactMatrixView.getViewDimensions();
+            return Math.min(width, height) / overview.binCount;
+        }
+
         const chr1Length = this.dataset.chromosomes[chr1].size
         const chr2Length = this.dataset.chromosomes[chr2].size
 
