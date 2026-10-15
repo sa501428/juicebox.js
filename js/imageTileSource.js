@@ -280,8 +280,8 @@ class ImageTileSource {
      * Compute and apply the automatic color scale threshold, if needed.
      *
      * The comparison modes are left alone -- their scales are user-driven, not
-     * derived from the data, and the threshold computed here measures raw
-     * counts on the primary map, which is not what any of them plot. Otherwise
+     * derived from the data, and the threshold computed here measures observed
+     * counts with the selected normalization, which is not what those modes plot. Otherwise
      * the threshold is memoized per chromosome pair, zoom and normalization, so
      * panning within a resolution does not refetch.
      */

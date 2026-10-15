@@ -31,7 +31,7 @@ import {getUrlMapper} from "./urlMapper.js"
 import Straw from 'hic-straw'
 import {SENTINEL_ZOOM} from './sentinelZoom.js'
 import Genome from './genome.js'
-import {V10DisplayMatrix, displayRecords} from './v10DatasetAdapter.js'
+import {V10DisplayMatrix, displayRecords, legacyColorScaleRecords} from './v10DatasetAdapter.js'
 
 const knownGenomes = {
 
@@ -422,7 +422,7 @@ class HiCDataset extends Dataset {
         return super.binSizeForZoom(zoom, chromosomeIndex);
     }
 
-    async getContactRecords(normalization, region1, region2, units, binsize) {
+    async getContactRecords(normalization, region1, region2, units, binsize, forScale = false) {
         const overview = this.allOverview;
         const scaled = overview?.version === 2 && units === 'BP' &&
             this.straw.getFileChrName(region1.chr).toLowerCase() === 'all' &&
@@ -431,11 +431,12 @@ class HiCDataset extends Dataset {
             scaled ? overview.finestResolution : binsize)
         if (scaled) {
             if (binsize !== overview.displayResolution) throw new Error('V10: invalid All display resolution');
-            return displayRecords(records, true).map(record => {
+            const display = displayRecords(records, true).map(record => {
                 record.bin1 /= overview.storageStride;
                 record.bin2 /= overview.storageStride;
                 return record;
             });
+            return forScale ? legacyColorScaleRecords(display, region1, region2, binsize) : display;
         }
         if (this.hicFile.version !== 10) {
             // Legacy Straw returns trans records in native index order, whereas
@@ -450,7 +451,8 @@ class HiCDataset extends Dataset {
             }) : records;
         }
         const sameChromosome = this.straw.getFileChrName(region1.chr) === this.straw.getFileChrName(region2.chr)
-        return displayRecords(records, sameChromosome)
+        const display = displayRecords(records, sameChromosome)
+        return forScale && sameChromosome ? legacyColorScaleRecords(display, region1, region2, binsize) : display
     }
 
     async hasNormalizationVector(type, chr, unit, binSize) {

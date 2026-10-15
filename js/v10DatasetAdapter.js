@@ -59,4 +59,18 @@ function displayRecords(records, sameChromosome) {
     })
 }
 
-export {V10DisplayMatrix, displayRecords}
+/**
+ * Match the legacy reader's canonical cis rectangle for the percentile sample.
+ * V10 also returns contacts whose reflection is inside an overlapping window;
+ * those are needed for painting but change the legacy color-scale population.
+ * A disjoint window above the diagonal is transposed before legacy filtering.
+ */
+function legacyColorScaleRecords(records, region1, region2, binSize) {
+    if (region1.start >= region2.end) [region1, region2] = [region2, region1]
+    const x1 = region1.start / binSize, x2 = region1.end / binSize
+    const y1 = region2.start / binSize, y2 = region2.end / binSize
+    return records.filter(record => record.bin1 >= x1 && record.bin1 < x2 &&
+        record.bin2 >= y1 && record.bin2 < y2)
+}
+
+export {V10DisplayMatrix, displayRecords, legacyColorScaleRecords}

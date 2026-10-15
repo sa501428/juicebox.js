@@ -4,6 +4,7 @@ import {File as NativeFile} from 'node:buffer'
 import {HiCDataset} from '../js/hicDataset.js'
 import ImageTileSource from '../js/imageTileSource.js'
 import ColorScale from '../js/colorScale.js'
+import {autoThreshold} from '../js/imageTileCore.js'
 import ChromosomeSelector from '../js/chromosomeSelector.js'
 import InteractionHandler from '../js/interactionHandler.js'
 import {createGestureBrowser} from './utils/gestureBrowser.js'
@@ -113,6 +114,49 @@ describe('v10 dataset and rendering integration', () => {
             .toEqual([[2, 1, 1]])
     })
 
+    it.each([10, 20])('matches legacy color-scale samples at %i BP, including overlapping cis windows', async binSize => {
+        const dataset = await load()
+        // Make the reflected-only contact large enough to change the percentile.
+        // Read positions and normalization through the real v10 decoder.
+        const query = dataset.straw.getContactRecords.bind(dataset.straw)
+        vi.spyOn(dataset.straw, 'getContactRecords').mockImplementation(async (...args) =>
+            (await query(...args)).map(record => {
+                if (record.bin1 !== record.bin2) record.counts *= 100
+                return record
+            }))
+        const raw = await dataset.straw.getContactRecords('NONE', region(), region(), 'BP', binSize)
+        // Exercise the real legacy filtering/normalization code on the same
+        // contacts, without needing a second binary fixture for every window.
+        const legacy = new HiCDataset({file: {}})
+        legacy.hicFile = legacy.straw.hicFile
+        Object.assign(legacy.hicFile, {
+            initialized: true, version: 9,
+            chromosomeIndexMap: dataset.hicFile.chromosomeIndexMap,
+            chrAliasTable: dataset.hicFile.chrAliasTable,
+            getBlocks: async () => [{records: raw}],
+            getNormalizationVector: dataset.hicFile.getNormalizationVector.bind(dataset.hicFile)
+        })
+        const narrowEnd = binSize === 10 ? 2 * binSize : binSize
+        const windows = [
+            [region('chrA', 0, 3 * binSize), region('chrA', 0, narrowEnd)],
+            [region('chrA', 0, narrowEnd), region('chrA', 0, 3 * binSize)],
+            [region(), region()],
+            [region('chrA', binSize, 3 * binSize), region('chrA', 0, binSize)]
+        ]
+        for (const normalization of ['NONE', 'VC']) {
+            for (const [first, second] of windows) {
+                const expected = await legacy.getContactRecords(normalization, first, second, 'BP', binSize, true)
+                const actual = await dataset.getContactRecords(normalization, first, second, 'BP', binSize, true)
+                expect(triples(actual)).toEqual(triples(expected))
+                expect(autoThreshold(actual, {})).toBe(autoThreshold(expected, {}))
+            }
+        }
+        // The normal rendering query must retain the mirrored contact.
+        const [first, second] = windows[0]
+        expect((await dataset.getContactRecords('NONE', first, second, 'BP', binSize)).length)
+            .toBeGreaterThan((await dataset.getContactRecords('NONE', first, second, 'BP', binSize, true)).length)
+    })
+
     it('keeps trans contacts in caller chromosome order', async () => {
         const dataset = await load('trans')
         const records = await dataset.getContactRecords('NONE', region('chrB', 0, 70), region(), 'BP', 10)
@@ -139,8 +183,10 @@ describe('v10 dataset and rendering integration', () => {
             }, displayMode: 'A', viewDimensions: {width: dimension, height: dimension}})) tiles.push(tile)
             expect(tiles[0].binSize).toBe(binSize)
             expect([...tiles[0].image.buffer.data].some(v => v !== 0)).toBe(true)
-            // chrA is index zero, but has no All identity. No x4 threshold.
-            expect(source.colorScale.threshold).toBe(column === 0 ? 5 : 1)
+            // No x4 heuristic for chromosome zero without All. In the
+            // overlapping upper window the legacy scale sample is empty,
+            // so retain the starting threshold while still painting contacts.
+            expect(source.colorScale.threshold).toBe(column === 1 ? 1 : 5)
         }
     })
 
