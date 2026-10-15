@@ -1,3 +1,5 @@
+import {locusForAllBin, allBinForLocus} from "./wholeGenomeLocus.js"
+
 /**
  * The genomic identity of the crosshairs: the locus under a pointer pixel, and
  * the inverse -- where a locus falls in a panel's own pixels. ADR-0020
@@ -55,19 +57,7 @@ function axisLocus(pixel, chrIndex, origin, state, dataset) {
         return {chr: name, bp: clamp(bin * dataset.binSizeForZoom(state.zoom), 0, size)}
     }
 
-    // The whole-genome view lays the real chromosomes end to end in the
-    // dataset's own order; walk them to find the one this position is in.
-    const genomeBP = Math.max(0, bin * dataset.wholeGenomeResolution)
-    const chromosomes = realChromosomes(dataset)
-    let offset = 0
-    for (const chromosome of chromosomes) {
-        if (genomeBP < offset + chromosome.size) {
-            return {chr: chromosome.name, bp: genomeBP - offset}
-        }
-        offset += chromosome.size
-    }
-    const last = chromosomes[chromosomes.length - 1]
-    return {chr: last.name, bp: last.size}
+    return locusForAllBin(bin, dataset)
 }
 
 function axisPixel(chrName, bp, chrIndex, origin, extent, state, dataset, genome) {
@@ -84,7 +74,7 @@ function axisPixel(chrName, bp, chrIndex, origin, extent, state, dataset, genome
 
     let bin
     if (dataset.isWholeGenome(chrIndex)) {
-        bin = (cumulativeOffset(chromosome, dataset) + bp) / dataset.wholeGenomeResolution
+        bin = allBinForLocus({chr: chrName, bp}, dataset, genome)
     } else if (chromosome.index === chrIndex) {
         bin = bp / dataset.binSizeForZoom(state.zoom)
     } else {
@@ -97,21 +87,6 @@ function axisPixel(chrName, bp, chrIndex, origin, extent, state, dataset, genome
 
 function clamp(value, min, max) {
     return Math.min(Math.max(value, min), max)
-}
-
-/** The bp at which a chromosome starts in this dataset's whole-genome view. */
-function cumulativeOffset(chromosome, dataset) {
-    let offset = 0
-    for (const candidate of realChromosomes(dataset)) {
-        if (candidate.index === chromosome.index) break
-        offset += candidate.size
-    }
-    return offset
-}
-
-/** The chromosome table without `All`, which is a zoom rung and not a chromosome (ADR-0010). */
-function realChromosomes(dataset) {
-    return dataset.chromosomes.filter(chromosome => !dataset.isWholeGenome(chromosome.index))
 }
 
 export {locusAtPixel, placeLocus}

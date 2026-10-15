@@ -259,3 +259,56 @@ describe('v10 dataset and rendering integration', () => {
         expect(browser.state.chr1).toBe(1)
     })
 })
+
+describe('control maps with reversed chromosome order', () => {
+    it('renders B with the active map\'s named axes even when B stores the trans pair in reverse', async () => {
+        const controlDataset = await load('trans')
+        const dataset = Object.create(controlDataset)
+        dataset.chromosomes = [
+            {...controlDataset.chromosomes[1], index: 0},
+            {...controlDataset.chromosomes[0], index: 1}
+        ]
+        const source = new ImageTileSource({
+            colorScale: new ColorScale({threshold: 5, r: 255, g: 0, b: 0}),
+            createTile: raster, tileDimension: 4
+        })
+        const tiles = []
+        for await (const tile of source.tilesFor({dataset, controlDataset, displayMode: 'B',
+            state: {chr1: 0, chr2: 1, zoom: 1, x: 0, y: 0, pixelSize: 1, normalization: 'NONE'},
+            viewDimensions: {width: 4, height: 4}
+        })) tiles.push(tile)
+        const image = tiles.find(t => t.row === 0 && t.column === 0).image.buffer
+        expect(image.data[(1 * 4 + 2) * 4 + 3]).toBeGreaterThan(0)
+        expect(image.data[(2 * 4 + 1) * 4 + 3]).toBe(0)
+    })
+
+    it.each([8, 9])('orients legacy V%i trans records to the requested chromosome names', async version => {
+        class Record {
+            constructor() { this.bin1 = 1; this.bin2 = 2; this.counts = 7 }
+            getKey() { return `${this.bin1}_${this.bin2}` }
+        }
+        const raw = new Record()
+        const dataset = Object.create(HiCDataset.prototype)
+        dataset.hicFile = {version, chromosomeIndexMap: {chrA: 0, chrB: 1}}
+        dataset.straw = {getFileChrName: name => name, getContactRecords: async () => [raw]}
+        const records = await dataset.getContactRecords('NONE', region('chrB'), region('chrA'), 'BP', 10)
+        expect(triples(records)).toEqual([[2, 1, 7]])
+        expect(records[0].getKey()).toBe('2_1')
+        expect(raw.getKey()).toBe('1_2')
+    })
+})
+
+describe('legacy All comparison layout checks', () => {
+    it('refuses an overlay when legacy files store real chromosomes in different orders', async () => {
+        const dataset = {
+            chromosomes: [{name: 'All', index: 0, size: 200}, {name: 'chrA', index: 1, size: 95000}, {name: 'chrB', index: 2, size: 75000}],
+            isWholeGenome: i => i === 0, wholeGenomeResolution: 1000
+        }
+        const controlDataset = {...dataset, chromosomes: [dataset.chromosomes[0],
+            {...dataset.chromosomes[2], index: 1}, {...dataset.chromosomes[1], index: 2}]}
+        const source = new ImageTileSource({createTile: raster, tileDimension: 4})
+        const tiles = source.tilesFor({dataset, controlDataset, displayMode: 'AOB',
+            state: {chr1: 0, chr2: 0, zoom: 0}, viewDimensions: {width: 4, height: 4}})
+        await expect(tiles.next()).rejects.toThrow('matching stored All layouts')
+    })
+})

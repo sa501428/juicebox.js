@@ -28,6 +28,7 @@
 
 import {DEFAULT_PIXEL_SIZE, MAX_PIXEL_SIZE} from "./hicBrowser.js"
 import {SENTINEL_ZOOM} from "./sentinelZoom.js"
+import {locusForAllBin, allBinForLocus} from "./wholeGenomeLocus.js"
 
 /**
  * State holds the canonical six fields that fully specify the view:
@@ -501,6 +502,9 @@ class State {
             chr2Name: dataset.chromosomes[this.chr2].name,
             binSize: dataset.binSizeForZoom(this.zoom, this.chr1),
             wholeGenomeBinSize: dataset.isWholeGenome(this.chr1) ? dataset.wholeGenomeResolution : undefined,
+            wholeGenomeLocus: dataset.isWholeGenome(this.chr1) ? {
+                x: locusForAllBin(this.x, dataset), y: locusForAllBin(this.y, dataset)
+            } : undefined,
             binX: this.x,
             binY: this.y,
             pixelSize: this.pixelSize
@@ -545,8 +549,10 @@ class State {
             zoomNew = 0
             const ratio = targetState.wholeGenomeBinSize && dataset.wholeGenomeResolution
                 ? targetState.wholeGenomeBinSize / dataset.wholeGenomeResolution : 1;
-            xBinNew = targetState.binX * ratio
-            yBinNew = targetState.binY * ratio
+            // An All origin is a named locus: cumulative coordinates change when
+            // files reorder chromosomes or pad their overview chromosome bins.
+            xBinNew = (targetState.wholeGenomeLocus?.x && allBinForLocus(targetState.wholeGenomeLocus.x, dataset, genome)) ?? targetState.binX * ratio
+            yBinNew = (targetState.wholeGenomeLocus?.y && allBinForLocus(targetState.wholeGenomeLocus.y, dataset, genome)) ?? targetState.binY * ratio
             targetPixelSize = targetState.pixelSize / ratio
         } else {
             zoomNew = (true === browser.resolutionLocked)

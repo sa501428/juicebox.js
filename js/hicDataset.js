@@ -437,7 +437,18 @@ class HiCDataset extends Dataset {
                 return record;
             });
         }
-        if (this.hicFile.version !== 10) return records
+        if (this.hicFile.version !== 10) {
+            // Legacy Straw returns trans records in native index order, whereas
+            // V10 returns the requested region order. Present one contract to
+            // the painter so a reordered control cannot silently flip axes.
+            const first = this.hicFile.chromosomeIndexMap[this.straw.getFileChrName(region1.chr)];
+            const second = this.hicFile.chromosomeIndexMap[this.straw.getFileChrName(region2.chr)];
+            return first > second ? records.map(record => {
+                const oriented = Object.assign(Object.create(Object.getPrototypeOf(record)), record);
+                [oriented.bin1, oriented.bin2] = [oriented.bin2, oriented.bin1];
+                return oriented;
+            }) : records;
+        }
         const sameChromosome = this.straw.getFileChrName(region1.chr) === this.straw.getFileChrName(region2.chr)
         return displayRecords(records, sameChromosome)
     }

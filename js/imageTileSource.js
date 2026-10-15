@@ -22,6 +22,7 @@
  * SOFTWARE.
  */
 
+import Genome from "./genome.js"
 import ColorScale from './colorScale.js'
 import {SENTINEL_ZOOM} from './sentinelZoom.js'
 import {
@@ -166,6 +167,15 @@ class ImageTileSource {
 
         const wholeGenome = dataset.isWholeGenome(state.chr1) || state.zoom === SENTINEL_ZOOM;
         let resolved;
+        if (wholeGenome && controlDataset && displayMode && displayMode !== 'A' && !dataset.allOverview && dataset.chromosomes && controlDataset.chromosomes) {
+            const a = dataset.chromosomes.filter(c => !dataset.isWholeGenome(c.index));
+            const b = controlDataset.chromosomes.filter(c => !controlDataset.isWholeGenome(c.index));
+            const genome = new Genome(controlDataset.genomeId, controlDataset.chromosomes);
+            if (controlDataset.allOverview || dataset.wholeGenomeResolution !== controlDataset.wholeGenomeResolution ||
+                a.length !== b.length || a.some((c, i) => genome.getChromosome(c.name) !== b[i] || c.size !== b[i].size)) {
+                throw new Error('Whole-genome comparison requires matching stored All layouts; select a chromosome to compare these maps');
+            }
+        }
         if (wholeGenome && dataset.allOverview) {
             resolved = {ds: dataset, dsControl: null, zoom: 0, controlZoom: 0};
             if (displayMode === 'B') resolved.ds = controlDataset;
@@ -185,10 +195,9 @@ class ImageTileSource {
         const {ds, dsControl, zoom, controlZoom} = resolved;
         const indicesFor = target => {
             if (target === dataset || !target.chromosomes || !dataset.chromosomes) return [state.chr1, state.chr2];
-            const canonical = name => name.toLowerCase().replace(/^chr/, '');
+            const genome = new Genome(target.genomeId, target.chromosomes);
             return [state.chr1, state.chr2].map(index => {
-                const name = canonical(dataset.chromosomes[index].name);
-                const chromosome = target.chromosomes.find(c => canonical(c.name) === name);
+                const chromosome = genome.getChromosome(dataset.chromosomes[index].name);
                 if (!chromosome) throw new Error(`Chromosome ${dataset.chromosomes[index].name} is absent from the control map`);
                 return chromosome.index ?? target.chromosomes.indexOf(chromosome);
             });
@@ -204,7 +213,11 @@ class ImageTileSource {
         const [chr1, chr2] = indicesFor(ds);
         const view = ds.matrixViewForZoom(chr1, chr2, zoom)
         const matrix = await ds.getMatrix(view.chr1, view.chr2)
-        const zd = matrix.getZoomDataByIndex(view.zoomIndex, "BP")
+        const nativeZD = matrix.getZoomDataByIndex(view.zoomIndex, "BP")
+        // Matrices are stored in file-index order; display axes belong to the
+        // active map. A control file may store this trans pair in reverse.
+        const zd = ds.chromosomes && view.chr1 !== view.chr2
+            ? {...nativeZD, chr1: ds.chromosomes[view.chr1], chr2: ds.chromosomes[view.chr2]} : nativeZD
 
         let zdControl = null
         if (dsControl) {

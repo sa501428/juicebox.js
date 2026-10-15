@@ -1673,6 +1673,16 @@ class HICBrowser {
             return;
         }
 
+        // V10 may omit All entirely. Such a peer can still follow the named
+        // loci carried by an overview publisher, at the same bp per pixel.
+        if (targetState.wholeGenomeLocus?.x && targetState.wholeGenomeLocus?.y &&
+            !this.genome.getChromosome(targetState.chr1Name)) {
+            const {x, y} = targetState.wholeGenomeLocus;
+            const binSize = targetState.wholeGenomeBinSize;
+            targetState = {...targetState, chr1Name: x.chr, chr2Name: y.chr,
+                binSize, binX: x.bp / binSize, binY: y.bp / binSize};
+        }
+
         // Unreachable by construction since #632: `pairSynchable` admits only
         // pairs with two-way chromosome parity, so every state a partner
         // publishes names chromosomes this genome can place. If it fires, the
